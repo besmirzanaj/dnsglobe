@@ -3,7 +3,11 @@
 /// operator's home region, not necessarily where the query lands. Lat/lon are
 /// therefore indicative, used for the world-map view.
 ///
-/// Every entry has been verified to answer external queries over UDP/TCP 53.
+/// Every entry has been verified to recursively resolve *uncommon* domains
+/// for external clients, over both UDP and TCP 53. Answering example.com is
+/// not enough: some resolvers (Bezeq IL, CNNIC CN) serve external clients
+/// from cache only and refuse or time out on everything else, which makes
+/// them useless for propagation checks.
 /// Africa currently has no reliable open Do53 resolver (large ISPs there
 /// refuse external queries); coverage comes from the anycast networks' POPs.
 pub struct Resolver {
@@ -202,11 +206,13 @@ pub const RESOLVERS: &[Resolver] = &[
         lon: 38.1,
     },
     Resolver {
-        name: "Bezeq Intl",
-        location: "IL",
-        ip: "192.115.106.10",
-        lat: 32.1,
-        lon: 34.8,
+        // Sanctions-bypass resolver: may hand back proxy IPs for a handful
+        // of sanctioned domains, real answers for everything else.
+        name: "Shecan",
+        location: "IR",
+        ip: "178.22.122.100",
+        lat: 35.7,
+        lon: 51.4,
     },
     // East Asia
     Resolver {
@@ -236,13 +242,6 @@ pub const RESOLVERS: &[Resolver] = &[
         ip: "180.76.76.76",
         lat: 39.9,
         lon: 116.4,
-    },
-    Resolver {
-        name: "CNNIC sDNS",
-        location: "CN",
-        ip: "1.2.4.8",
-        lat: 40.5,
-        lon: 116.9,
     },
     Resolver {
         name: "360 Secure DNS",
