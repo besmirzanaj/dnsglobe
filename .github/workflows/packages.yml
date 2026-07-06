@@ -1,8 +1,5 @@
-# Builds .deb and .rpm packages for dnsglobe after a release and pushes
-# them to the Gemfury repo at https://repo.cloudalbania.com/.
-#
-# Expects this GitHub secret:
-#   GEMFURY_PUSH_URL  — e.g. https://<token>@push.fury.io/<account>/
+# Wraps the x86_64 Linux binary built by the Release workflow into .deb and
+# .rpm packages using nfpm, then pushes them to the Gemfury repo.
 name: Linux packages
 
 on:
@@ -21,24 +18,38 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust
+      - name: Download x86_64 Linux binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          gh run download "$RUN_ID" \
+            --name artifacts-build-local-x86_64_unknown_linux_gnu \
+            --dir dist-artifacts
 
-      - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
+      - name: Extract binary
+        run: |
+          mkdir -p build
+          tar xzf dist-artifacts/dnsglobe-x86_64-unknown-linux-gnu.tar.gz -C build
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION=$(./build/dnsglobe --version | awk '{print $2}')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install nfpm
+        run: |
+          curl -sfL https://install.goreleaser.com/github.com/goreleaser/nfpm.sh | sh
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Build .deb
-        run: cargo deb
+        run: nfpm package --packager deb --target .
         env:
-          CARGO_PROFILE_RELEASE_LTO: thin
-
-      - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm --locked
+          NFPMS_VERSION: ${{ steps.version.outputs.version }}
 
       - name: Build .rpm
-        run: cargo generate-rpm
+        run: nfpm package --packager rpm --target .
 
       - name: Push to Gemfury
         env:
@@ -48,7 +59,7 @@ jobs:
             echo "GEMFURY_PUSH_URL not set — skipping push"
             exit 0
           fi
-          for pkg in target/debian/*.deb target/generate-rpm/*.rpm; do
+          for pkg in dnsglobe_*.deb dnsglobe-*.rpm; do
             [ -f "$pkg" ] || continue
             echo "Uploading $pkg …"
             curl -sSf -F "package=@$pkg" "$PUSH_URL" || echo "gemfury push failed for $pkg"
