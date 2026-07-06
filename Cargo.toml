@@ -1,6 +1,6 @@
 [package]
 name = "dnsglobe"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.85"
 description = "Global DNS propagation checker TUI — watch a DNS record propagate across 39 public resolvers worldwide, on a world map in your terminal"
@@ -10,6 +10,15 @@ license = "MIT"
 homepage = "https://github.com/besmirzanaj/dnsglobe"
 repository = "https://github.com/besmirzanaj/dnsglobe"
 readme = "README.md"
+
+[package.metadata.deb]
+maintainer = "Besmir Zanaj <besmir@cloudalbania.com>"
+copyright = "2024-2026, Besmir Zanaj <besmir@cloudalbania.com>"
+license-file = ["LICENSE", "4"]
+extended-description = "Global DNS propagation checker TUI — watch a DNS record propagate across 39 public resolvers worldwide, on a world map in your terminal"
+depends = "$auto"
+section = "net"
+priority = "optional"
 
 [dependencies]
 anyhow = "1.0"
