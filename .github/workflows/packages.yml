@@ -40,8 +40,7 @@ jobs:
 
       - name: Install nfpm
         run: |
-          curl -sfL https://install.goreleaser.com/github.com/goreleaser/nfpm.sh | sh
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz | tar xz -C /usr/local/bin nfpm
 
       - name: Build .deb
         run: nfpm package --packager deb --target .
