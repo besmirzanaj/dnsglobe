@@ -30,7 +30,7 @@ jobs:
         run: cargo install cargo-deb --locked
 
       - name: Build .deb
-        run: cargo deb -- --locked
+        run: cargo deb
         env:
           CARGO_PROFILE_RELEASE_LTO: thin
 
@@ -39,8 +39,6 @@ jobs:
 
       - name: Build .rpm
         run: cargo generate-rpm
-        env:
-          CARGO_PROFILE_RELEASE_LTO: thin
 
       - name: Push to Gemfury
         env:
