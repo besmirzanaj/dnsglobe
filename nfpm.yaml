@@ -1,3 +1,4 @@
+name: dnsglobe
 version: "${NFPMS_VERSION}"
 release: 1
 arch: amd64
