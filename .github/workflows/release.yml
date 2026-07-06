@@ -278,47 +278,6 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
-  publish-linux-packages:
-    needs:
-      - plan
-      - host
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
-      - name: Build .deb
-        run: cargo deb -- --locked
-        env:
-          CARGO_PROFILE_RELEASE_LTO: thin
-      - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm --locked
-      - name: Build .rpm
-        run: cargo generate-rpm
-        env:
-          CARGO_PROFILE_RELEASE_LTO: thin
-      - name: Push to Gemfury
-        env:
-          PUSH_URL: ${{ secrets.GEMFURY_PUSH_URL }}
-        run: |
-          if [ -z "$PUSH_URL" ]; then
-            echo "GEMFURY_PUSH_URL not set — skipping push"
-            exit 0
-          fi
-          for pkg in target/debian/*.deb target/generate-rpm/*.rpm; do
-            [ -f "$pkg" ] || continue
-            echo "Uploading $pkg …"
-            curl -sSf -F "package=@$pkg" "$PUSH_URL" || echo "gemfury push failed for $pkg"
-          done
-
   publish-homebrew-formula:
     needs:
       - plan
@@ -370,11 +329,10 @@ jobs:
       - plan
       - host
       - publish-homebrew-formula
-      - publish-linux-packages
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.publish-linux-packages.result == 'skipped' || needs.publish-linux-packages.result == 'success') }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
