@@ -4,10 +4,31 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **A global DNS propagation checker for your terminal** — a Rust TUI that
-queries 34 public DNS resolvers around the world in parallel, compares their
+queries 40 public DNS resolvers around the world in parallel, compares their
 answers, and shows the propagation of your record on a world map.
 
-![dnsglobe demo — checking A and NS records for a domain across 34 resolvers worldwide](demo/demo.gif)
+```text
+$ dnsglobe --once example.com
+example.com A
+
+Google Public DNS      Anycast  8.8.8.8          OK         13ms  ttl=243     104.20.23.154, 172.66.147.243
+Cloudflare             Anycast  1.1.1.1          OK         11ms  ttl=163     104.20.23.154, 172.66.147.243
+Quad9                  CH/Any   9.9.9.9          OK         11ms  ttl=215     104.20.23.154, 172.66.147.243
+Level3                 US       4.2.2.2          OK         21ms  ttl=223     104.20.23.154, 172.66.147.243
+CIRA Canadian Shield   CA       149.112.121.10   OK         91ms  ttl=188     104.20.23.154, 172.66.147.243
+DNS4EU                 EU/Any   86.54.11.100     OK         11ms  ttl=127     104.20.23.154, 172.66.147.243
+AdGuard DNS            EU/Any   94.140.14.14     OK         15ms  ttl=242     104.20.23.154, 172.66.147.243
+Yandex DNS             RU       77.88.8.8        DIFFERS    48ms  ttl=206     8.47.69.0, 8.6.112.0
+Comss.one              RU       83.220.169.155   DIFFERS    49ms  ttl=5408    8.47.69.0, 8.6.112.0
+114DNS                 CN       114.114.114.114  OK        146ms  ttl=177     104.20.23.154, 172.66.147.243
+ByteDance Public DNS   CN       180.184.1.1      OK        301ms  ttl=599     104.20.23.154, 172.66.147.243
+Telstra                AU       139.130.4.4      OK        294ms  ttl=242     104.20.23.154, 172.66.147.243
+UOL                    BR       200.221.11.100   OK        196ms  ttl=230     104.20.23.154, 172.66.147.243
+...                    (40 resolvers total)
+
+40 of 40 responding · 0 unreachable · 2 answer group(s)
+propagation (38/40 responding): 104.20.23.154, 172.66.147.243
+```
 
 Think dnschecker.org / whatsmydns.net, but in your terminal, with watch mode:
 start a check and it re-polls until the record has propagated everywhere.

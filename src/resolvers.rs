@@ -95,6 +95,20 @@ pub const RESOLVERS: &[Resolver] = &[
         lon: -121.9,
     },
     Resolver {
+        name: "DNSWatchGO",
+        location: "US",
+        ip: "54.174.40.213",
+        lat: 38.9,
+        lon: -77.4,
+    },
+    Resolver {
+        name: "Dyn (Oracle)",
+        location: "US",
+        ip: "216.146.35.35",
+        lat: 43.0,
+        lon: -71.5,
+    },
+    Resolver {
         name: "CIRA Canadian Shield",
         location: "CA",
         ip: "149.112.121.10",
@@ -143,6 +157,27 @@ pub const RESOLVERS: &[Resolver] = &[
         ip: "185.222.222.222",
         lat: 50.1,
         lon: 8.7,
+    },
+    Resolver {
+        name: "DNS for Family",
+        location: "DE",
+        ip: "94.130.180.225",
+        lat: 50.5,
+        lon: 12.3,
+    },
+    Resolver {
+        name: "LibreDNS",
+        location: "DE",
+        ip: "88.198.92.222",
+        lat: 49.5,
+        lon: 11.1,
+    },
+    Resolver {
+        name: "Surfshark DNS",
+        location: "LT",
+        ip: "194.169.169.169",
+        lat: 54.7,
+        lon: 25.3,
     },
     // Russia / Middle East
     Resolver {
@@ -215,6 +250,13 @@ pub const RESOLVERS: &[Resolver] = &[
         ip: "101.226.4.6",
         lat: 31.2,
         lon: 121.5,
+    },
+    Resolver {
+        name: "ByteDance Public DNS",
+        location: "CN",
+        ip: "180.184.1.1",
+        lat: 40.0,
+        lon: 116.3,
     },
     Resolver {
         name: "KT (Kornet)",
