@@ -17,6 +17,9 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 publish-jobs = ["homebrew"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+# gzip instead of the default xz: minimal container images have gzip but
+# rarely xz, and the shell installer relies on the host's tar to decompress
+unix-archive = ".tar.gz"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
