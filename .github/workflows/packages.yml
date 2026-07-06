@@ -49,6 +49,8 @@ jobs:
 
       - name: Build .rpm
         run: nfpm package --packager rpm --target .
+        env:
+          NFPMS_VERSION: ${{ steps.version.outputs.version }}
 
       - name: Push to Gemfury
         env:
