@@ -25,6 +25,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
 
+    if matches!(args.peek().map(String::as_str), Some("--version" | "-V")) {
+        println!("dnsglobe {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // `--once <domain> [type] [--output json|csv]` runs a single check and
     // prints to stdout — handy for scripts and for testing without a TTY.
     if args.peek().map(String::as_str) == Some("--once") {
