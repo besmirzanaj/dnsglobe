@@ -4,7 +4,7 @@ arch: amd64
 license: MIT
 vendor: "Besmir Zanaj"
 homepage: "https://github.com/besmirzanaj/dnsglobe"
-maintainer: "Besmir Zanaj <besmir@cloudalbania.com>"
+maintainer: "Besmir Zanaj <besmirzanaj@gmail.com>"
 description: |-
   Global DNS propagation checker — watch a DNS record propagate across
   39 public resolvers worldwide, on a world map in your terminal.

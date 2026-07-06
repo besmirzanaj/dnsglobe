@@ -24,13 +24,13 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           gh run download "$RUN_ID" \
-            --name artifacts-build-local-x86_64_unknown_linux_gnu \
+            --name artifacts-build-local-x86_64-unknown-linux-gnu \
             --dir dist-artifacts
 
       - name: Extract binary
         run: |
           mkdir -p build
-          tar xzf dist-artifacts/dnsglobe-x86_64-unknown-linux-gnu.tar.gz -C build
+          tar xzf dist-artifacts/dnsglobe-x86_64-unknown-linux-gnu.tar.gz -C build --strip-components=1
 
       - name: Determine version
         id: version
