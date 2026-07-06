@@ -34,7 +34,7 @@ error, yellow in flight).
 Install:
 
 ```sh
-brew install 514-labs/tap/dnsglobe   # Homebrew (macOS/Linux)
+brew install besmirzanaj/tap/dnsglobe   # Homebrew (macOS/Linux)
 cargo install dnsglobe               # from crates.io
 # or grab a prebuilt binary from the GitHub Releases page
 ```
