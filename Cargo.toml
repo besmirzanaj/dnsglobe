@@ -1,14 +1,14 @@
 [package]
 name = "dnsglobe"
-version = "0.3.1"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.85"
-description = "Global DNS propagation checker TUI — watch a DNS record propagate across 34 public resolvers worldwide, on a world map in your terminal"
+description = "Global DNS propagation checker TUI — watch a DNS record propagate across 39 public resolvers worldwide, on a world map in your terminal"
 keywords = ["dns", "propagation", "tui", "terminal", "networking"]
 categories = ["command-line-utilities", "network-programming"]
 license = "MIT"
-homepage = "https://github.com/514-labs/dnsglobe"
-repository = "https://github.com/514-labs/dnsglobe"
+homepage = "https://github.com/besmirzanaj/dnsglobe"
+repository = "https://github.com/besmirzanaj/dnsglobe"
 readme = "README.md"
 
 [dependencies]
