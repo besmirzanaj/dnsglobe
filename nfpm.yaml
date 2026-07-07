@@ -1,0 +1,17 @@
+name: dnsglobe
+version: "${NFPMS_VERSION}"
+release: 1
+arch: amd64
+license: MIT
+vendor: "Besmir Zanaj"
+homepage: "https://github.com/besmirzanaj/dnsglobe"
+maintainer: "Besmir Zanaj <besmirzanaj@gmail.com>"
+description: |-
+  Global DNS propagation checker — watch a DNS record propagate across
+  39 public resolvers worldwide, on a world map in your terminal.
+
+contents:
+  - src: build/dnsglobe
+    dst: /usr/bin/dnsglobe
+    file_info:
+      mode: 0755

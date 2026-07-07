@@ -44,11 +44,11 @@ actually serving your queries.
 Install:
 
 ```sh
-brew install 514-labs/tap/dnsglobe   # Homebrew (macOS/Linux)
+brew install besmirzanaj/tap/dnsglobe   # Homebrew (macOS/Linux)
 cargo install dnsglobe               # from crates.io
 yay -S dnsglobe                      # from archlinux aur (compile from source)
 yay -S dnsglobe-bin                  # from archlinux aur (install prebuilt binary)
-nix run github:514-labs/dnsglobe     # Nix flakes (builds from source)
+nix run github:besmirzanaj/dnsglobe     # Nix flakes (builds from source)
 # or grab a prebuilt binary from the GitHub Releases page
 ```
 
@@ -122,17 +122,17 @@ The project provides optional Nix flake outputs for users who already use Nix. T
 
 ```bash
 # Latest source from default branch
-nix run github:514-labs/dnsglobe
+nix run github:besmirzanaj/dnsglobe
 
 # Specific release (uses the flake at that git tag)
-nix run github:514-labs/dnsglobe/v0.3.1
+nix run github:besmirzanaj/dnsglobe/v0.3.1
 
 # Named outputs (if the flake exposes them): #latest, #source
-nix run github:514-labs/dnsglobe#source
+nix run github:besmirzanaj/dnsglobe#source
 
 # Build / develop
-nix build github:514-labs/dnsglobe
-nix develop github:514-labs/dnsglobe
+nix build github:besmirzanaj/dnsglobe
+nix develop github:besmirzanaj/dnsglobe
 ```
 
 The flake exposes `packages.<system>.default`, `apps.<system>.default`, `devShells.<system>.default`, and `overlays.default`.

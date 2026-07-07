@@ -1,0 +1,67 @@
+# Wraps the x86_64 Linux binary built by the Release workflow into .deb and
+# .rpm packages using nfpm, then pushes them to the Gemfury repo.
+name: Linux packages
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download x86_64 Linux binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          gh run download "$RUN_ID" \
+            --name artifacts-build-local-x86_64-unknown-linux-gnu \
+            --dir dist-artifacts
+
+      - name: Extract binary
+        run: |
+          mkdir -p build
+          tar xzf dist-artifacts/dnsglobe-x86_64-unknown-linux-gnu.tar.gz -C build --strip-components=1
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION=$(./build/dnsglobe --version | awk '{print $2}')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install nfpm
+        run: |
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz | tar xz -C /usr/local/bin nfpm
+
+      - name: Build .deb
+        run: nfpm package --packager deb --target .
+        env:
+          NFPMS_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Build .rpm
+        run: nfpm package --packager rpm --target .
+        env:
+          NFPMS_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Push to Gemfury
+        env:
+          PUSH_URL: ${{ secrets.GEMFURY_PUSH_URL }}
+        run: |
+          if [ -z "$PUSH_URL" ]; then
+            echo "GEMFURY_PUSH_URL not set — skipping push"
+            exit 0
+          fi
+          for pkg in dnsglobe_*.deb dnsglobe-*.rpm; do
+            [ -f "$pkg" ] || continue
+            echo "Uploading $pkg …"
+            curl -sSf -F "package=@$pkg" "$PUSH_URL" || echo "gemfury push failed for $pkg"
+          done
