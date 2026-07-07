@@ -59,6 +59,8 @@ dnsglobe                            # start empty, type a domain
 dnsglobe example.com                # query immediately and watch
 dnsglobe example.com TXT            # same, starting on TXT records
 dnsglobe --once example.com TXT     # no TUI: print results, exit (for scripts)
+dnsglobe --once example.com --output json   # machine-readable JSON
+dnsglobe --once example.com A --output csv  # CSV (RFC 4180), values joined with |
 ```
 
 ### Keys

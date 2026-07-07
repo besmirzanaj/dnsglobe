@@ -51,9 +51,22 @@ struct Cli {
     #[arg(value_parser = parse_record_type)]
     record_type: Option<RecordType>,
 
-    /// Run a single check, print a plain-text table, and exit (no TTY needed)
+    /// Run a single check, print the results, and exit (no TTY needed)
     #[arg(long, requires = "domain")]
     once: bool,
+
+    /// Output format for --once [default: text]
+    #[arg(long, value_enum, requires = "once")]
+    output: Option<OutputFormat>,
+}
+
+/// Output format for `--once`, selected with `--output`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    Csv,
 }
 
 fn parse_record_type(s: &str) -> Result<RecordType, String> {
@@ -77,11 +90,12 @@ async fn main() -> Result<()> {
     // error prints normally.
     resolvers::init(config::load()?);
 
-    // `--once` runs a single check and prints plain text — handy for scripts
+    // `--once` runs a single check and prints to stdout — handy for scripts
     // and for testing without a TTY.
     if cli.once {
         let domain = cli.domain.expect("clap enforces `requires`");
-        return run_once(domain, cli.record_type.unwrap_or(RecordType::A)).await;
+        let format = cli.output.unwrap_or_default();
+        return run_once(domain, cli.record_type.unwrap_or(RecordType::A), format).await;
     }
 
     let terminal = ratatui::init();
@@ -321,7 +335,7 @@ fn spawn_round(
 }
 
 /// Plain-text single run: query every resolver once, print a table, exit.
-async fn run_once(domain: String, rtype: RecordType) -> Result<()> {
+async fn run_once(domain: String, rtype: RecordType, format: OutputFormat) -> Result<()> {
     let mut app = App::new(domain);
     app.rtype_idx = app::RECORD_TYPES
         .iter()
@@ -363,6 +377,15 @@ async fn run_once(domain: String, rtype: RecordType) -> Result<()> {
     }
 
     let summary = app.summary();
+    match format {
+        OutputFormat::Text => print_text(&domain, rtype, &app, &summary),
+        OutputFormat::Json => print_json(&domain, rtype, &app, &summary),
+        OutputFormat::Csv => print_csv(&app, &summary),
+    }
+    Ok(())
+}
+
+fn print_text(domain: &str, rtype: RecordType, app: &App, summary: &app::Summary) {
     println!("{domain} {rtype}\n");
     for (i, (resolver, row)) in resolvers::active().iter().zip(&app.rows).enumerate() {
         let line = match row {
@@ -423,7 +446,7 @@ async fn run_once(domain: String, rtype: RecordType) -> Result<()> {
     }
     if summary.responding > 0
         && summary.agree == summary.responding
-        && let Some(est) = app.estimated_ttl(&summary)
+        && let Some(est) = app.estimated_ttl(summary)
         && est >= app::ADVISORY_TTL
     {
         println!(
@@ -431,5 +454,175 @@ async fn run_once(domain: String, rtype: RecordType) -> Result<()> {
             app::fmt_secs(u64::from(est))
         );
     }
-    Ok(())
+}
+
+/// One resolver's result flattened for machine-readable output. `ttl` and
+/// `detail` (rcode or error message) are mutually exclusive by status.
+struct OnceRow<'a> {
+    status: &'static str,
+    elapsed_ms: Option<u128>,
+    ttl: Option<u32>,
+    values: &'a [String],
+    detail: Option<&'a str>,
+}
+
+fn once_row<'a>(row: &'a app::RowState, in_majority: bool) -> OnceRow<'a> {
+    match row {
+        app::RowState::Done {
+            result, elapsed, ..
+        } => {
+            let elapsed_ms = Some(elapsed.as_millis());
+            match result {
+                dns::QueryResult::Records { values, min_ttl } => OnceRow {
+                    status: if in_majority { "ok" } else { "differs" },
+                    elapsed_ms,
+                    ttl: Some(*min_ttl),
+                    values,
+                    detail: None,
+                },
+                dns::QueryResult::NoRecords(code) => OnceRow {
+                    status: "none",
+                    elapsed_ms,
+                    ttl: None,
+                    values: &[],
+                    detail: Some(code.as_str()),
+                },
+                dns::QueryResult::ServFail => OnceRow {
+                    status: "servfail",
+                    elapsed_ms,
+                    ttl: None,
+                    values: &[],
+                    detail: None,
+                },
+                dns::QueryResult::Error(err) => OnceRow {
+                    status: "error",
+                    elapsed_ms,
+                    ttl: None,
+                    values: &[],
+                    detail: Some(err.as_str()),
+                },
+            }
+        }
+        _ => OnceRow {
+            status: "unknown",
+            elapsed_ms: None,
+            ttl: None,
+            values: &[],
+            detail: None,
+        },
+    }
+}
+
+fn print_json(domain: &str, rtype: RecordType, app: &App, summary: &app::Summary) {
+    let resolvers = resolvers::active();
+    let mut out = String::from("{\n");
+    out.push_str(&format!("  \"domain\": {},\n", json_string(domain)));
+    out.push_str(&format!(
+        "  \"record_type\": {},\n",
+        json_string(&rtype.to_string())
+    ));
+    out.push_str("  \"resolvers\": [\n");
+    for (i, (resolver, row)) in resolvers.iter().zip(&app.rows).enumerate() {
+        let r = once_row(row, summary.majority_rows[i]);
+        let values: Vec<String> = r.values.iter().map(|v| json_string(v)).collect();
+        out.push_str(&format!(
+            "    {{\"name\": {}, \"location\": {}, \"ip\": {}, \"status\": {}, \"elapsed_ms\": {}, \"ttl\": {}, \"values\": [{}], \"detail\": {}}}{}\n",
+            json_string(&resolver.name),
+            json_string(&resolver.location),
+            json_string(&resolver.ip.to_string()),
+            json_string(r.status),
+            r.elapsed_ms.map_or("null".into(), |ms| ms.to_string()),
+            r.ttl.map_or("null".into(), |t| t.to_string()),
+            values.join(", "),
+            r.detail.map_or("null".into(), json_string),
+            if i + 1 < resolvers.len() { "," } else { "" },
+        ));
+    }
+    out.push_str("  ],\n");
+    let majority: Vec<String> = summary
+        .majority_values
+        .iter()
+        .map(|v| json_string(v))
+        .collect();
+    out.push_str(&format!(
+        "  \"summary\": {{\"ok\": {}, \"responding\": {}, \"servfail\": {}, \"unreachable\": {}, \"groups\": {}, \"agree\": {}, \"majority_values\": [{}]}}\n",
+        summary.ok,
+        summary.responding,
+        summary.servfail,
+        summary.errors,
+        summary.groups,
+        summary.agree,
+        majority.join(", "),
+    ));
+    out.push('}');
+    println!("{out}");
+}
+
+fn print_csv(app: &App, summary: &app::Summary) {
+    println!("name,location,ip,status,elapsed_ms,ttl,values,detail");
+    for (i, (resolver, row)) in resolvers::active().iter().zip(&app.rows).enumerate() {
+        let r = once_row(row, summary.majority_rows[i]);
+        println!(
+            "{},{},{},{},{},{},{},{}",
+            csv_field(&resolver.name),
+            csv_field(&resolver.location),
+            csv_field(&resolver.ip.to_string()),
+            r.status,
+            r.elapsed_ms.map_or(String::new(), |ms| ms.to_string()),
+            r.ttl.map_or(String::new(), |t| t.to_string()),
+            csv_field(&r.values.join("|")),
+            csv_field(r.detail.unwrap_or("")),
+        );
+    }
+}
+
+/// Serialize as a JSON string literal (quotes included).
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Quote a CSV field when it contains a delimiter, quote, or newline
+/// (RFC 4180: embedded quotes are doubled).
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{csv_field, json_string};
+
+    #[test]
+    fn json_string_escapes_quotes_backslashes_and_controls() {
+        assert_eq!(json_string("plain"), r#""plain""#);
+        assert_eq!(
+            json_string(r#"v=DKIM1; p="x\y""#),
+            r#""v=DKIM1; p=\"x\\y\"""#
+        );
+        assert_eq!(json_string("a\nb\u{1}"), r#""a\nb\u0001""#);
+    }
+
+    #[test]
+    fn csv_field_quotes_only_when_needed() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
 }
