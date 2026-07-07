@@ -6,13 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-07
+
+Fork release: rebuilds the besmirzanaj fork on upstream 0.3.1 (clap CLI,
+TOML resolver config, anycast site geolocation, SERVFAIL as a propagation
+signal, cache-expiry countdowns) and re-applies the fork's features.
+
 ### Added
 
-- Nix flake support: `nix run github:514-labs/dnsglobe` builds and runs
-  dnsglobe from source on any system with Nix flakes enabled; specific
-  releases can be pinned via git tag (`github:514-labs/dnsglobe/v0.3.0`).
-  A `devbox.json` is included for reproducible development environments.
+- 7 verified resolvers: DNSWatchGO, Dyn (Oracle), DNS for Family, LibreDNS,
+  Surfshark DNS, Shecan (IR) and ByteDance Public DNS — 39 built-ins total.
+- `--output json|csv` for `--once`: machine-readable output, including a
+  `servfail` status and a `servfail` count in the JSON summary.
+- Nix flake support: `nix run github:besmirzanaj/dnsglobe` builds and runs
+  dnsglobe from source on any system with Nix flakes enabled. A
+  `devbox.json` is included for reproducible development environments.
   ([#10](https://github.com/514-labs/dnsglobe/issues/10))
+
+### Removed
+
+- Cache-only resolvers Bezeq Intl and CNNIC sDNS: they refuse or time out
+  on uncommon names from external clients, so they are useless as
+  propagation signals.
+
+### Changed
+
+- Distribution stays fork-native: Homebrew tap `besmirzanaj/homebrew-tap`,
+  tar.gz unix artifacts, and .deb/.rpm packages pushed to Gemfury.
 
 ## [0.3.1] - 2026-07-06
 
