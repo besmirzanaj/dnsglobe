@@ -6,10 +6,10 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **A global DNS propagation checker for your terminal** — a Rust TUI that
-queries 34 public DNS resolvers around the world in parallel, compares their
+queries 39 public DNS resolvers around the world in parallel, compares their
 answers, and shows the propagation of your record on a world map.
 
-![dnsglobe demo — checking A and NS records for a domain across 34 resolvers worldwide](demo/demo.gif)
+![dnsglobe demo — checking A and NS records for a domain across 39 resolvers worldwide](demo/demo.gif)
 
 Think dnschecker.org / whatsmydns.net, but in your terminal, with watch mode:
 start a check and it re-polls until the record has propagated everywhere.

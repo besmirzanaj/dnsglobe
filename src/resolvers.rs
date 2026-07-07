@@ -61,7 +61,11 @@ struct Builtin {
 /// operator's home region, not necessarily where the query lands. Lat/lon are
 /// therefore indicative, used for the world-map view.
 ///
-/// Every entry has been verified to answer external queries over UDP/TCP 53.
+/// Every entry has been verified to recursively resolve *uncommon* domains
+/// for external clients, over both UDP and TCP 53. Answering example.com is
+/// not enough: some resolvers (Bezeq IL, CNNIC CN) serve external clients
+/// from cache only and refuse or time out on everything else, which makes
+/// them useless for propagation checks.
 /// Africa currently has no reliable open Do53 resolver (large ISPs there
 /// refuse external queries); coverage comes from the anycast networks' POPs.
 const BUILTIN: &[Builtin] = &[
@@ -129,6 +133,22 @@ const BUILTIN: &[Builtin] = &[
         ip: "74.82.42.42",
         lat: 37.6,
         lon: -122.0,
+        probe: None,
+    },
+    Builtin {
+        name: "DNSWatchGO",
+        location: "US",
+        ip: "54.174.40.213",
+        lat: 38.9,
+        lon: -77.4,
+        probe: None,
+    },
+    Builtin {
+        name: "Dyn (Oracle)",
+        location: "US",
+        ip: "216.146.35.35",
+        lat: 43.0,
+        lon: -71.5,
         probe: None,
     },
     Builtin {
@@ -212,6 +232,30 @@ const BUILTIN: &[Builtin] = &[
         lon: 8.7,
         probe: None,
     },
+    Builtin {
+        name: "DNS for Family",
+        location: "DE",
+        ip: "94.130.180.225",
+        lat: 50.5,
+        lon: 12.3,
+        probe: None,
+    },
+    Builtin {
+        name: "LibreDNS",
+        location: "DE",
+        ip: "88.198.92.222",
+        lat: 49.5,
+        lon: 11.1,
+        probe: None,
+    },
+    Builtin {
+        name: "Surfshark DNS",
+        location: "LT",
+        ip: "194.169.169.169",
+        lat: 54.7,
+        lon: 25.3,
+        probe: None,
+    },
     // Russia / Middle East
     Builtin {
         name: "SafeDNS",
@@ -238,11 +282,11 @@ const BUILTIN: &[Builtin] = &[
         probe: None,
     },
     Builtin {
-        name: "Bezeq Intl",
-        location: "IL",
-        ip: "192.115.106.10",
-        lat: 32.1,
-        lon: 34.8,
+        name: "Shecan",
+        location: "IR",
+        ip: "178.22.122.100",
+        lat: 35.7,
+        lon: 51.4,
         probe: None,
     },
     // East Asia
@@ -279,11 +323,11 @@ const BUILTIN: &[Builtin] = &[
         probe: None,
     },
     Builtin {
-        name: "CNNIC sDNS",
+        name: "ByteDance Public DNS",
         location: "CN",
-        ip: "1.2.4.8",
-        lat: 40.5,
-        lon: 116.9,
+        ip: "180.184.1.1",
+        lat: 40.0,
+        lon: 116.3,
         probe: None,
     },
     Builtin {
