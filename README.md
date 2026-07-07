@@ -52,6 +52,37 @@ nix run github:besmirzanaj/dnsglobe     # Nix flakes (builds from source)
 # or grab a prebuilt binary from the GitHub Releases page
 ```
 
+### Debian / Ubuntu (.deb) and RHEL / Fedora (.rpm)
+
+x86_64 packages are published to the
+[CloudAlbania package repository](https://packages.cloudalbania.com/) on
+every release.
+
+Debian / Ubuntu:
+
+```sh
+echo "deb [trusted=yes] https://repo.cloudalbania.com/apt/ /" | sudo tee /etc/apt/sources.list.d/cloudalbania.list
+sudo apt update
+sudo apt install dnsglobe
+```
+
+RHEL / Fedora / Rocky / Alma:
+
+```sh
+sudo tee /etc/yum.repos.d/cloudalbania.repo <<'EOF'
+[cloudalbania]
+name=CloudAlbania Repository
+baseurl=https://repo.cloudalbania.com/yum
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install dnsglobe
+```
+
+The repository is unsigned (`trusted=yes` / `gpgcheck=0` disable GPG
+verification), so use it only if you are comfortable trusting the repo host
+over HTTPS alone.
+
 Run:
 
 ```sh
