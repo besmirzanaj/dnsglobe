@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Synced with upstream 0.4.0: 3D rotating globe view (Ctrl+O), EDNS Client
+  Subnet support (`--ecs`), runtime resolver add/remove (`+` / Ctrl+X), and
+  configurable `[theme]` colors — see the 0.4.0 section below. The fork's
+  `--output json|csv` now composes with `--ecs`: JSON wraps each subnet's
+  results in a `rounds` array (tagged with the subnet and an `ecs_blind`
+  count), CSV adds a trailing `ecs` column, and resolvers that ignore ECS
+  report a `no-ecs` status. Without `--ecs`, both formats are unchanged.
+  ([#2](https://github.com/besmirzanaj/dnsglobe/pull/2))
+
 ## [0.4.0] - 2026-07-11
 
 ### Added

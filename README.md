@@ -115,6 +115,11 @@ per-subnet convergence summary. Resolvers that deliberately ignore ECS
 reference but excluded from the propagation percentage, since it describes
 their own location, not the probed network.
 
+`--ecs` composes with `--once --output`: JSON wraps each subnet's results in
+a `rounds` array (tagged with the subnet and an `ecs_blind` count), CSV adds
+a trailing `ecs` column, and ECS-ignoring resolvers report a `no-ecs`
+status. Without `--ecs`, both formats are unchanged.
+
 ### Keys
 
 | Key            | Action                          |
