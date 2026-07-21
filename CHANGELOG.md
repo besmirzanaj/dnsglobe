@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-22
+
+Fork release: delivers upstream 0.4.0 (see below) with the fork's features
+re-applied.
+
 ### Changed
 
 - Synced with upstream 0.4.0: 3D rotating globe view (Ctrl+O), EDNS Client
