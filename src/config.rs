@@ -1,6 +1,7 @@
 //! Optional TOML config file that adds resolvers to the built-in list, or
 //! replaces the list entirely (e.g. to check propagation across your own
-//! infrastructure, or an internal split-horizon zone).
+//! infrastructure, or an internal split-horizon zone), and recolors the UI
+//! via a `[theme]` table.
 //!
 //! Looked up at `$DNSGLOBE_CONFIG`, else `$XDG_CONFIG_HOME/dnsglobe/config.toml`,
 //! else `~/.config/dnsglobe/config.toml`. A missing default file just means
@@ -12,7 +13,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::app::ViewMode;
+use crate::dns::{self, ClientSubnet};
 use crate::resolvers::{self, Resolver};
+use crate::theme::{self, Theme};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,8 +25,33 @@ pub struct Config {
     /// extending it.
     #[serde(default)]
     replace: bool,
+    /// Preferred map panel style; the --view flag overrides it.
+    view: Option<ViewMode>,
+    /// EDNS Client Subnets to query with; the --ecs flag overrides the lot.
+    #[serde(default)]
+    ecs: Vec<String>,
+    #[serde(default)]
+    theme: ThemeTable,
     #[serde(default)]
     resolvers: Vec<Entry>,
+}
+
+/// Raw `[theme]` colors as written in the file; validated into a
+/// `theme::Theme` by `build_theme`. Every key is optional — unset roles keep
+/// their defaults, so a theme can adjust a single color.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThemeTable {
+    accent: Option<String>,
+    agree: Option<String>,
+    differ: Option<String>,
+    error: Option<String>,
+    pending: Option<String>,
+    stale: Option<String>,
+    upstream: Option<String>,
+    muted: Option<String>,
+    coastline: Option<String>,
+    grid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,28 +68,71 @@ struct Entry {
     lon: Option<f64>,
 }
 
-/// Load the resolver list for this run: built-ins plus (or replaced by) the
-/// config file, if one exists.
-pub fn load() -> Result<Vec<Resolver>> {
+/// Everything the config file contributes to a run.
+pub struct Settings {
+    pub resolvers: Vec<Resolver>,
+    pub view: Option<ViewMode>,
+    pub ecs: Vec<ClientSubnet>,
+    pub theme: Theme,
+}
+
+impl Settings {
+    fn defaults() -> Self {
+        Self {
+            resolvers: resolvers::defaults(),
+            view: None,
+            ecs: Vec::new(),
+            theme: Theme::default(),
+        }
+    }
+}
+
+/// Load run settings: the resolver list (built-ins plus, or replaced by, the
+/// config file) and the preferred view, if a config file exists.
+pub fn load() -> Result<Settings> {
     let (path, required) = match std::env::var_os("DNSGLOBE_CONFIG") {
         Some(path) => (Some(PathBuf::from(path)), true),
         None => (default_path(), false),
     };
     let Some(path) = path else {
-        return Ok(resolvers::defaults());
+        return Ok(Settings::defaults());
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {
-            return Ok(resolvers::defaults());
+            return Ok(Settings::defaults());
         }
         Err(err) => {
             return Err(err).with_context(|| format!("reading config file {}", path.display()));
         }
     };
-    let config: Config =
+    let mut config: Config =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    resolver_list(config).with_context(|| format!("invalid config {}", path.display()))
+    let view = config.view;
+    let theme = build_theme(std::mem::take(&mut config.theme))
+        .with_context(|| format!("invalid config {}", path.display()))?;
+    let ecs = ecs_list(std::mem::take(&mut config.ecs))
+        .with_context(|| format!("invalid config {}", path.display()))?;
+    let resolvers =
+        resolver_list(config).with_context(|| format!("invalid config {}", path.display()))?;
+    Ok(Settings {
+        resolvers,
+        view,
+        ecs,
+        theme,
+    })
+}
+
+/// Parse the `ecs` array, erroring with the offending entry so a typo'd
+/// subnet is easy to find in the file.
+fn ecs_list(entries: Vec<String>) -> Result<Vec<ClientSubnet>> {
+    entries
+        .iter()
+        .map(|entry| {
+            dns::parse_ecs(entry)
+                .map_err(|message| anyhow::anyhow!("ecs entry {entry:?}: {message}"))
+        })
+        .collect()
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -69,6 +141,31 @@ fn default_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(base.join("dnsglobe").join("config.toml"))
+}
+
+/// Overlay the config's `[theme]` colors on the defaults, erroring with the
+/// offending key so a typo'd color is easy to find in the file.
+fn build_theme(table: ThemeTable) -> Result<Theme> {
+    let mut out = Theme::default();
+    for (key, value, slot) in [
+        ("accent", table.accent, &mut out.accent),
+        ("agree", table.agree, &mut out.agree),
+        ("differ", table.differ, &mut out.differ),
+        ("error", table.error, &mut out.error),
+        ("pending", table.pending, &mut out.pending),
+        ("stale", table.stale, &mut out.stale),
+        ("upstream", table.upstream, &mut out.upstream),
+        ("coastline", table.coastline, &mut out.coastline),
+        ("grid", table.grid, &mut out.grid),
+    ] {
+        if let Some(value) = value {
+            *slot = theme::parse_color(&value).with_context(|| format!("theme.{key}"))?;
+        }
+    }
+    if let Some(value) = table.muted {
+        out.muted = theme::parse_muted(&value).context("theme.muted")?;
+    }
+    Ok(out)
 }
 
 /// Validate the config and merge it with the built-in list.
@@ -221,6 +318,79 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("-90..=90"));
+    }
+
+    #[test]
+    fn view_parses_all_modes_and_rejects_typos() {
+        for (text, want) in [
+            ("view = \"auto\"", ViewMode::Auto),
+            ("view = \"map\"", ViewMode::Map),
+            ("view = \"globe\"", ViewMode::Globe),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.view, Some(want));
+        }
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.view, None);
+        assert!(toml::from_str::<Config>("view = \"sphere\"").is_err());
+    }
+
+    fn theme(toml_text: &str) -> Result<Theme> {
+        let config: Config = toml::from_str(toml_text)?;
+        build_theme(config.theme)
+    }
+
+    #[test]
+    fn missing_or_empty_theme_keeps_the_defaults() {
+        assert_eq!(theme("").unwrap(), Theme::default());
+        assert_eq!(theme("[theme]").unwrap(), Theme::default());
+    }
+
+    #[test]
+    fn theme_overrides_only_the_given_roles() {
+        let theme = theme(
+            r##"
+            [theme]
+            accent = "#ff8700"
+            muted = "darkgray"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(theme.accent, ratatui::style::Color::Rgb(0xff, 0x87, 0x00));
+        assert_eq!(
+            theme.muted,
+            crate::theme::Muted::Color(ratatui::style::Color::DarkGray)
+        );
+        assert_eq!(theme.agree, Theme::default().agree);
+    }
+
+    #[test]
+    fn bad_theme_color_errors_with_the_key_name() {
+        let err = theme("[theme]\nstale = \"ornage\"").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("theme.stale"), "{chain}");
+        assert!(chain.contains("\"ornage\""), "{chain}");
+    }
+
+    #[test]
+    fn ecs_entries_parse_with_bare_ips_getting_full_prefixes() {
+        let config: Config = toml::from_str(r#"ecs = ["203.0.113.77/24", "2001:db8::1"]"#).unwrap();
+        let subnets = ecs_list(config.ecs).unwrap();
+        // Host bits zeroed, bare address gets a full-length prefix.
+        assert_eq!(dns::fmt_ecs(&subnets[0]), "203.0.113.0/24");
+        assert_eq!(dns::fmt_ecs(&subnets[1]), "2001:db8::1/128");
+    }
+
+    #[test]
+    fn bad_ecs_entry_errors_with_the_entry_text() {
+        let config: Config = toml::from_str(r#"ecs = ["10.0.0.0/33"]"#).unwrap();
+        let err = ecs_list(config.ecs).unwrap_err();
+        assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
+    }
+
+    #[test]
+    fn unknown_theme_keys_are_rejected_to_catch_typos() {
+        assert!(toml::from_str::<Config>("[theme]\naccnt = \"red\"").is_err());
     }
 
     #[test]

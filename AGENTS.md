@@ -48,10 +48,14 @@ methods rather than mutating state inline.
      table without needing a TTY.
    - TUI behavior (key bindings, rendering, watch mode): drive the real
      binary through a PTY, e.g. with `expect` or tmux, and assert on the
-     rendered output. Two PTY gotchas: an `expect`-spawned PTY starts with
+     rendered output. Three PTY gotchas: an `expect`-spawned PTY starts with
      zero size (fix with `stty rows 30 columns 110 < $spawn_out(slave,name)`
-     after spawn), and Tcl's `\x` escape eats all following hex digits —
-     write `Esc` as `\033`, never `\x1b` followed by a hex-looking char.
+     after spawn); Tcl's `\x` escape eats all following hex digits —
+     write `Esc` as `\033`, never `\x1b` followed by a hex-looking char;
+     and Tcl's `sleep` stops reading the PTY, so a continuously-redrawing
+     app fills the ~16KB kernel buffer and blocks mid-write, freezing
+     frames — wait with `expect -timeout N "ZZZ_never_matches"` instead,
+     which keeps draining output.
 
 6. **Keep the UI discoverable.** A new key binding must appear in the footer
    hint line in `draw_footer` (`src/ui.rs`). Mind macOS/Windows/Linux
@@ -61,7 +65,11 @@ methods rather than mutating state inline.
 
 7. **Update `CHANGELOG.md`.** Add an entry under `[Unreleased]` in the
    matching Keep-a-Changelog section (`Added`/`Changed`/`Fixed`), written
-   for users, ending with a link to the PR.
+   for users, ending with a link to the PR. Exception: fixing a bug that was
+   itself introduced in `[Unreleased]` gets no entry — no released version
+   ever had the bug, so there is nothing for users to note. If the fix
+   changes behavior that an existing `[Unreleased]` entry describes, amend
+   that entry instead.
 
 8. **Refresh the demo if visuals changed.** The README GIF is recorded with
    [vhs](https://github.com/charmbracelet/vhs) from `demo/demo.tape`.

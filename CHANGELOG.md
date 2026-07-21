@@ -6,6 +6,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-11
+
+### Added
+
+- Resolvers can be added and removed at runtime: `+` opens an add-resolver
+  dialog (name and IP, plus optional location and map coordinates, validated
+  like the config file), ↑/↓ highlight a row in the table, and Ctrl+X
+  removes the highlighted resolver. Changes last for the session; permanent
+  resolvers still belong in the config file. A resolver added mid-watch is
+  queried immediately and joins the propagation math.
+  ([#30](https://github.com/514-labs/dnsglobe/pull/30))
+- EDNS Client Subnet (RFC 7871) support: `--ecs 203.0.113.0/24` (or
+  `ecs = [...]` in the config file) attaches that client subnet to every
+  query, so GeoDNS zones answer for that network instead of each resolver's
+  own vantage point. Takes CIDRs or bare IPs, and accepts several subnets to
+  compare how answers converge across client networks: Ctrl+N cycles the
+  active subnet in the TUI (re-querying as it goes), and `--once` prints one
+  table per subnet plus a convergence summary. Resolvers that deliberately ignore ECS (Cloudflare,
+  Quad9, …) are tagged `NO ECS` and left out of the propagation percentage —
+  their answer describes their own location, not the probed network.
+  ([#14](https://github.com/514-labs/dnsglobe/issues/14),
+  [#29](https://github.com/514-labs/dnsglobe/pull/29))
+- 3D rotating globe view: the flat resolver map can morph into a spinning
+  orthographic globe, with the resolver status dots riding their continents
+  and hiding on the far hemisphere as the planet turns. The globe keeps the
+  map's braille rendering, adds a faint graticule so the rotation reads even
+  over open ocean, and is tilted 15° so the northern-hemisphere resolver
+  clusters stay clear of the limb.
+  ([#26](https://github.com/514-labs/dnsglobe/pull/26))
+- The view is responsive by default: the square-ish globe needs fewer
+  columns than the 350°-wide flat map, so narrow terminals get the globe
+  (down to widths that previously showed no map at all) and wide ones the
+  flat map — resizing across the threshold animates the morph live. Ctrl+O
+  toggles by hand and pins the choice; `--view auto|map|globe` or `view =
+  "..."` in the config file force it outright (flag beats config).
+  ([#26](https://github.com/514-labs/dnsglobe/pull/26))
+
+- Nix flake support: `nix run github:514-labs/dnsglobe` builds and runs
+  dnsglobe from source on any system with Nix flakes enabled; specific
+  releases can be pinned via git tag (`github:514-labs/dnsglobe/v0.3.0`).
+  A `devbox.json` is included for reproducible development environments.
+  ([#10](https://github.com/514-labs/dnsglobe/issues/10),
+  [#21](https://github.com/514-labs/dnsglobe/pull/21))
+- Custom color themes: a `[theme]` table in the config file recolors any UI
+  role (`accent`, `agree`, `differ`, `error`, `pending`, `stale`,
+  `upstream`, `muted`, `coastline`, `grid`) using ANSI color names,
+  256-color indexes, or hex values.
+  ([#27](https://github.com/514-labs/dnsglobe/pull/27))
+
+### Changed
+
+- ↑/↓ (and PageUp/PageDown) move a highlight through the resolver table
+  instead of scrolling it directly; the view scrolls along to keep the
+  highlight visible. ([#30](https://github.com/514-labs/dnsglobe/pull/30))
+- Tab / Shift-Tab now re-query the checked domain with the newly selected
+  record type right away, instead of waiting for Enter — matching the new
+  Ctrl+N behavior for ECS subnets.
+  ([#29](https://github.com/514-labs/dnsglobe/pull/29))
+- The default palette now stays legible on terminal themes with mid-toned
+  backgrounds, like macOS Terminal's "Ocean": de-emphasized text uses the
+  faint attribute instead of dark gray (dimming your theme's own foreground
+  color, which is always readable), and status colors moved to the bright
+  ANSI range. Past-TTL is now orange to stay distinct from the brighter
+  error red. Set `muted = "darkgray"` in `[theme]` to restore the old
+  de-emphasis on terminals that render faint poorly.
+  ([#25](https://github.com/514-labs/dnsglobe/issues/25),
+  [#27](https://github.com/514-labs/dnsglobe/pull/27))
+
 ## [0.3.2] - 2026-07-07
 
 Fork release: rebuilds the besmirzanaj fork on upstream 0.3.1 (clap CLI,
@@ -151,7 +219,8 @@ Initial release.
   that re-polls every 30s until all responding resolvers agree.
 - `--once` plain-text mode for scripts.
 
-[Unreleased]: https://github.com/514-labs/dnsglobe/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/514-labs/dnsglobe/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/514-labs/dnsglobe/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/514-labs/dnsglobe/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/514-labs/dnsglobe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/514-labs/dnsglobe/compare/v0.1.1...v0.2.0
