@@ -9,7 +9,7 @@
 queries 39 public DNS resolvers around the world in parallel, compares their
 answers, and shows the propagation of your record on a world map.
 
-![dnsglobe demo — checking A and NS records for a domain across 39 resolvers worldwide](demo/demo.gif)
+![dnsglobe demo — checking A and NS records for a domain across resolvers worldwide with EDNS Client Subnet, cycling the client subnet, then morphing the world map into a rotating globe](demo/demo.gif)
 
 Think dnschecker.org / whatsmydns.net, but in your terminal, with watch mode:
 start a check and it re-polls until the record has propagated everywhere.
@@ -27,9 +27,13 @@ consistent answer, not twenty conflicting ones. The propagation gauge shows
 how many resolvers are in the majority group; outliers are flagged
 `≠ DIFFERS` once all results are in.
 
-On terminals ≥150 columns wide, a world map appears on the right with one
-dot per resolver, colored by status (green agrees, magenta differs, red
-error, yellow in flight).
+When the terminal is wide enough, a view of the world appears on the right
+with one dot per resolver, colored by status (green agrees, magenta differs,
+red error, yellow in flight). The view adapts to the width: terminals ≥157
+columns get a flat world map, narrower ones (≥131 columns) get a spinning 3D
+globe, which needs fewer columns; resizing across the threshold morphs one
+into the other. Ctrl+O toggles map/globe by hand, and `--view auto|map|globe`
+(or `view = "..."` in the config file) forces a style outright.
 
 Anycast networks are asked which of their sites is answering you: Quad9
 (`TXT id.server.on.quad9.net`), Cloudflare (`CH TXT id.server`), Google
@@ -92,7 +96,29 @@ dnsglobe example.com TXT            # same, starting on TXT records
 dnsglobe --once example.com TXT     # no TUI: print results, exit (for scripts)
 dnsglobe --once example.com --output json   # machine-readable JSON
 dnsglobe --once example.com A --output csv  # CSV (RFC 4180), values joined with |
+dnsglobe example.com --ecs 203.0.113.0/24        # see the zone as that client network does
+dnsglobe --once example.com --ecs 203.0.113.0/24,198.51.100.0/24
+                                    # one table per subnet + a convergence summary
 ```
+
+### EDNS Client Subnet (ECS)
+
+`--ecs` (or `ecs = [...]` in the config file) attaches an EDNS Client Subnet
+option ([RFC 7871](https://datatracker.ietf.org/doc/html/rfc7871)) to every
+query, so GeoDNS zones answer for that client network instead of the
+resolver's own vantage point. Subnets are CIDRs or bare IPs; most public
+resolvers use at most /24 (IPv4) or /56 (IPv6). With several subnets
+configured, Ctrl+N cycles the active one (plus an *off* position) and
+re-queries immediately; `--once` runs every subnet and ends with a
+per-subnet convergence summary. Resolvers that deliberately ignore ECS
+(Cloudflare, Quad9, …) are tagged `NO ECS` — their answer is shown for
+reference but excluded from the propagation percentage, since it describes
+their own location, not the probed network.
+
+`--ecs` composes with `--once --output`: JSON wraps each subnet's results in
+a `rounds` array (tagged with the subnet and an `ecs_blind` count), CSV adds
+a trailing `ecs` column, and ECS-ignoring resolvers report a `no-ecs`
+status. Without `--ecs`, both formats are unchanged.
 
 ### Keys
 
@@ -102,9 +128,13 @@ dnsglobe --once example.com A --output csv  # CSV (RFC 4180), values joined with
 | ←/→ / Home/End | move cursor in the domain field |
 | Enter          | start the check and watch: re-polls every 30 s until propagation reaches 100% |
 | Ctrl+R         | stop or resume watching         |
-| Tab / Shift-Tab | select record type (A, AAAA, CNAME, MX, NS, TXT, SOA) |
-| ↑/↓ / PgUp/PgDn | scroll the resolver table |
+| Tab / Shift-Tab | select record type (A, AAAA, CNAME, MX, NS, TXT, SOA) and re-query |
+| ↑/↓ / PgUp/PgDn | move the highlight through the resolver table (scrolls to follow) |
+| +              | add a resolver for this session (name, IP, optional location and map position) |
+| Ctrl+X         | remove the highlighted resolver for this session |
 | Ctrl+S         | cycle table sort: resolver / location / time / status / answer |
+| Ctrl+O         | toggle the world view between flat map and rotating globe |
+| Ctrl+N         | cycle the ECS client subnet and re-query (only when `--ecs`/config set one up) |
 | Ctrl+U         | clear domain                    |
 | Esc / Ctrl+C   | quit                            |
 
@@ -120,6 +150,13 @@ use a different path.
 # e.g. to watch propagation across your own nameservers only.
 replace = false
 
+# EDNS Client Subnet(s) to query with (Ctrl+N cycles; --ecs overrides).
+ecs = ["203.0.113.0/24"]
+
+# World-view style: auto (default — pick by terminal width), map, or globe.
+# The --view flag overrides this.
+view = "auto"
+
 [[resolvers]]
 name = "Corp DNS"        # required — shown in the Resolver column
 ip = "10.0.0.53"         # required — IPv4 or IPv6, queried on port 53
@@ -130,10 +167,28 @@ lon = -74.0              #            omit both to leave it off the map
 [[resolvers]]
 name = "NS1 (public)"
 ip = "198.51.100.53"
+
+# Optionally recolor the UI. Every key is optional; unset roles keep their
+# defaults. Colors are ANSI names ("lightcyan"), 256-color indexes ("208"),
+# or hex ("#ff8700" — needs truecolor support).
+[theme]
+accent   = "lightcyan"    # borders, titles, cursor, anycast sites
+agree    = "lightgreen"   # answers matching the majority; fast latency
+differ   = "lightmagenta" # answers disagreeing with the majority
+error    = "lightred"     # ERR / SERVFAIL / NONE; slow latency
+pending  = "lightyellow"  # queries in flight; middling latency
+stale    = "208"          # caches serving an answer past its own TTL
+upstream = "lightblue"    # refetched but upstream still has the old data
+muted    = "faint"        # labels, hints, countdowns, quiet borders —
+                          # "faint" dims your terminal's default foreground;
+                          # set a color if your terminal renders faint poorly
+coastline = "gray"        # map/globe land outline
+grid      = "244"         # globe graticule and limb
 ```
 
-Invalid config (bad IP, unknown key, `lat` without `lon`, `replace = true`
-with no resolvers) is reported at startup with the offending entry named.
+Invalid config (bad IP, unknown key, unrecognized color, bad `ecs` subnet,
+`lat` without `lon`, `replace = true` with no resolvers) is reported at
+startup with the offending entry named.
 
 ## Notes
 

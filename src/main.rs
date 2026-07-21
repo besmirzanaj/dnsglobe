@@ -1,9 +1,12 @@
 mod app;
 mod config;
 mod dns;
+mod globe;
 mod resolvers;
 mod sites;
+mod theme;
 mod ui;
+mod world_data;
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -17,7 +20,7 @@ use hickory_resolver::proto::rr::RecordType;
 use tokio::sync::mpsc;
 
 use app::{App, POLL_INTERVAL};
-use dns::QueryOutcome;
+use dns::{ClientSubnet, QueryOutcome};
 
 const CONFIG_HELP: &str = "\
 Configuration:
@@ -26,13 +29,23 @@ Configuration:
   is missing), else $XDG_CONFIG_HOME/dnsglobe/config.toml, else
   ~/.config/dnsglobe/config.toml.
 
+  # view = \"globe\"       # map panel style: auto (default) | map | globe
   # replace = true       # use only the resolvers below, drop the built-ins
+  # ecs = [\"203.0.113.0/24\"]  # EDNS Client Subnet(s) to query with;
+  #                      #   cycle with Ctrl+N (--ecs overrides the list)
   [[resolvers]]
   name = \"Corp DNS\"      # required
   ip = \"10.0.0.53\"       # required, IPv4 or IPv6
   location = \"HQ\"        # optional; shown in the Loc column
   lat = 40.7             # optional map position;
-  lon = -74.0            # give both or neither";
+  lon = -74.0            # give both or neither
+
+  [theme]                # optional; override any UI color role
+  # accent = \"lightcyan\" # roles: accent, agree, differ, error, pending,
+  # stale = \"208\"        #   stale, upstream, muted, coastline, grid
+  # muted = \"faint\"      # colors: ANSI names (\"lightred\"), 256-color
+  #                      #   indexes (\"208\"), or hex (\"#ff8700\"); `muted`
+  #                      #   also takes \"faint\" (dim the default foreground)";
 
 /// Global DNS propagation checker TUI — watch a DNS record propagate across
 /// public resolvers worldwide, on a world map in your terminal.
@@ -58,6 +71,20 @@ struct Cli {
     /// Output format for --once [default: text]
     #[arg(long, value_enum, requires = "once")]
     output: Option<OutputFormat>,
+
+    /// Map panel style: auto picks the globe on narrow terminals and the
+    /// flat map on wide ones [overrides the config file's `view`]
+    #[arg(long, value_enum)]
+    view: Option<app::ViewMode>,
+
+    /// Query with this EDNS Client Subnet (RFC 7871) to see the zone as a
+    /// specific client network does (GeoDNS/split answers). CIDR or bare IP;
+    /// most resolvers use at most /24 (IPv4) or /56 (IPv6), and some ignore
+    /// ECS entirely (marked "no ecs"). Repeat or comma-separate to compare
+    /// several networks: Ctrl+N cycles in the TUI, --once prints every one
+    /// [overrides the config file's `ecs`]
+    #[arg(long, value_delimiter = ',', value_parser = dns::parse_ecs)]
+    ecs: Vec<ClientSubnet>,
 }
 
 /// Output format for `--once`, selected with `--output`.
@@ -88,14 +115,23 @@ async fn main() -> Result<()> {
 
     // Fail on a broken config before the terminal enters raw mode, so the
     // error prints normally.
-    resolvers::init(config::load()?);
+    let settings = config::load()?;
+    let view = cli.view.or(settings.view).unwrap_or_default();
+    let ecs_list = if cli.ecs.is_empty() {
+        settings.ecs
+    } else {
+        cli.ecs
+    };
+    resolvers::init(settings.resolvers);
+    theme::init(settings.theme);
 
     // `--once` runs a single check and prints to stdout — handy for scripts
     // and for testing without a TTY.
     if cli.once {
         let domain = cli.domain.expect("clap enforces `requires`");
         let format = cli.output.unwrap_or_default();
-        return run_once(domain, cli.record_type.unwrap_or(RecordType::A), format).await;
+        let rtype = cli.record_type.unwrap_or(RecordType::A);
+        return run_once(domain, rtype, ecs_list, format).await;
     }
 
     let terminal = ratatui::init();
@@ -111,7 +147,14 @@ async fn main() -> Result<()> {
             )
         );
     }
-    let result = run_tui(terminal, cli.domain.unwrap_or_default(), cli.record_type).await;
+    let result = run_tui(
+        terminal,
+        cli.domain.unwrap_or_default(),
+        cli.record_type,
+        view,
+        ecs_list,
+    )
+    .await;
     if enhanced_keys {
         let _ = crossterm::execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
     }
@@ -123,9 +166,13 @@ async fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     initial_domain: String,
     initial_rtype: Option<RecordType>,
+    view: app::ViewMode,
+    ecs_list: Vec<ClientSubnet>,
 ) -> Result<()> {
     let auto_query = !initial_domain.is_empty();
     let mut app = App::new(initial_domain);
+    app.view_mode = view;
+    app.set_ecs_list(ecs_list);
     if let Some(rtype) = initial_rtype {
         app.rtype_idx = app::RECORD_TYPES
             .iter()
@@ -138,10 +185,11 @@ async fn run_tui(
     let (tx, mut rx) = mpsc::unbounded_channel::<QueryOutcome>();
     // Anycast site discoveries arrive on their own channel: they have no
     // generation — the answering POP depends on our network path, not on
-    // what domain is being checked.
-    let (site_tx, mut site_rx) = mpsc::unbounded_channel::<(usize, sites::Site)>();
+    // what domain is being checked. Keyed by IP, not index: the resolver
+    // list can be edited while a probe is in flight.
+    let (site_tx, mut site_rx) = mpsc::unbounded_channel::<(IpAddr, sites::Site)>();
 
-    spawn_site_probes(&site_tx);
+    spawn_site_probes(&app, &site_tx);
     if auto_query {
         spawn_queries(&mut app, &tx);
     }
@@ -184,8 +232,8 @@ async fn run_tui(
                     }
                 }
             }
-            Some((index, site)) = site_rx.recv() => {
-                app.sites[index] = Some(site);
+            Some((ip, site)) = site_rx.recv() => {
+                app.set_site(ip, site);
             }
             _ = tick.tick() => {
                 if app.in_flight() {
@@ -209,16 +257,44 @@ fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) {
+    // The add-resolver dialog captures all input while open.
+    if app.form.is_some() {
+        handle_form_key(app, tx, code, modifiers);
+        return;
+    }
     match code {
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
+        }
+        // `+` never appears in a domain name, so it's free for "add a
+        // resolver" despite the input field owning most printable keys.
+        KeyCode::Char('+') => app.open_form(),
+        // Ctrl+X: cut the highlighted resolver from the session's list.
+        KeyCode::Char('x') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(round) = app.remove_selected() {
+                spawn_round(app, tx, round);
+            }
         }
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.clear_domain();
         }
         KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.sort = app.sort.next();
+        }
+        // Ctrl+O: "O" is the globe. Ctrl+G would be the natural mnemonic but
+        // it's the BEL character, which some terminal setups intercept.
+        KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_globe();
+        }
+        // Ctrl+N: next client network (Ctrl+E is taken by end-of-line).
+        // Cycling re-queries right away — no Enter needed to see the new
+        // subnet's answers; before the first query it just moves the chip.
+        KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if !app.ecs_list.is_empty() {
+                app.cycle_ecs();
+                requery_selection(app, tx);
+            }
         }
         KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
             if app.auto_refresh || app.next_poll.is_some() {
@@ -232,8 +308,16 @@ fn handle_key(
             }
         }
         KeyCode::Enter => spawn_queries(app, tx),
-        KeyCode::Tab => app.cycle_record_type(true),
-        KeyCode::BackTab => app.cycle_record_type(false),
+        // Tab re-queries as it cycles, like Ctrl+N for ECS — no Enter needed
+        // to see the newly selected type's answers.
+        KeyCode::Tab => {
+            app.cycle_record_type(true);
+            requery_selection(app, tx);
+        }
+        KeyCode::BackTab => {
+            app.cycle_record_type(false);
+            requery_selection(app, tx);
+        }
         // Cmd+←/→ on macOS (reported as SUPER under the kitty keyboard
         // protocol): jump to the start/end of the input, like Home/End.
         KeyCode::Left if modifiers.contains(KeyModifiers::SUPER) => app.cursor = 0,
@@ -261,10 +345,12 @@ fn handle_key(
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.cursor = app.domain.len();
         }
-        KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
-        KeyCode::Down => app.scroll += 1, // clamped during draw
-        KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
-        KeyCode::PageDown => app.scroll += 10,
+        // Arrows move the table highlight; the view scrolls to follow it
+        // (the draw pass keeps the selection visible).
+        KeyCode::Up => app.move_selection(-1),
+        KeyCode::Down => app.move_selection(1),
+        KeyCode::PageUp => app.move_selection(-10),
+        KeyCode::PageDown => app.move_selection(10),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
         KeyCode::Char(c)
@@ -278,29 +364,80 @@ fn handle_key(
     }
 }
 
+/// Key handling while the add-resolver dialog is open: Tab/↑/↓ move between
+/// fields, Enter validates and adds, Esc cancels. Field text takes any
+/// printable ASCII (names have spaces, IPv6 has colons).
+fn handle_form_key(
+    app: &mut App,
+    tx: &mpsc::UnboundedSender<QueryOutcome>,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) {
+    let Some(form) = app.form.as_mut() else {
+        return;
+    };
+    match code {
+        KeyCode::Esc => app.cancel_form(),
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        KeyCode::Enter => {
+            if let Some(round) = app.submit_form() {
+                spawn_round(app, tx, round);
+            }
+        }
+        KeyCode::Tab | KeyCode::Down => form.cycle_focus(true),
+        KeyCode::BackTab | KeyCode::Up => form.cycle_focus(false),
+        KeyCode::Left => form.move_cursor_left(),
+        KeyCode::Right => form.move_cursor_right(),
+        KeyCode::Home => form.cursor_home(),
+        KeyCode::End => form.cursor_end(),
+        KeyCode::Backspace => form.backspace(),
+        KeyCode::Delete => form.delete(),
+        KeyCode::Char(c)
+            if !modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            form.insert_char(c);
+        }
+        _ => {}
+    }
+}
+
 /// Start a fresh query from the input field and turn watch mode on.
 fn spawn_queries(app: &mut App, tx: &mpsc::UnboundedSender<QueryOutcome>) {
-    let Some(params) = app.begin_query() else {
+    let Some(round) = app.begin_query() else {
         return;
     };
     app.auto_refresh = true;
     app.next_poll = None;
-    spawn_round(tx, params);
+    spawn_round(app, tx, round);
+}
+
+/// Re-run the checked domain with the current record-type/ECS selection —
+/// Tab and Ctrl+N refresh the table as they cycle; inert before the first
+/// query.
+fn requery_selection(app: &mut App, tx: &mpsc::UnboundedSender<QueryOutcome>) {
+    let Some(round) = app.begin_reselect() else {
+        return;
+    };
+    app.next_poll = None;
+    spawn_round(app, tx, round);
 }
 
 /// Re-poll the last-queried domain/type (watch mode).
 fn poll_query(app: &mut App, tx: &mpsc::UnboundedSender<QueryOutcome>) {
-    let Some(params) = app.begin_requery() else {
+    let Some(round) = app.begin_requery() else {
         return;
     };
     app.next_poll = None;
-    spawn_round(tx, params);
+    spawn_round(app, tx, round);
 }
 
 /// Ask each anycast resolver which of its sites is answering us (issue #6).
 /// One shot per run: the site follows our network path, not the query.
-fn spawn_site_probes(site_tx: &mpsc::UnboundedSender<(usize, sites::Site)>) {
-    for (index, resolver) in resolvers::active().iter().enumerate() {
+fn spawn_site_probes(app: &App, site_tx: &mpsc::UnboundedSender<(IpAddr, sites::Site)>) {
+    for resolver in &app.resolvers {
         let Some(probe) = resolver.probe else {
             continue;
         };
@@ -308,116 +445,200 @@ fn spawn_site_probes(site_tx: &mpsc::UnboundedSender<(usize, sites::Site)>) {
         let server = resolver.ip;
         tokio::spawn(async move {
             if let Some(site) = sites::discover(probe, server).await {
-                let _ = site_tx.send((index, site));
+                let _ = site_tx.send((server, site));
             }
         });
     }
 }
 
-fn spawn_round(
-    tx: &mpsc::UnboundedSender<QueryOutcome>,
-    (domain, rtype, generation, indices): (String, RecordType, u64, Vec<usize>),
-) {
-    for resolver_index in indices {
+fn spawn_round(app: &App, tx: &mpsc::UnboundedSender<QueryOutcome>, round: app::Round) {
+    for resolver_index in round.indices {
         let tx = tx.clone();
-        let domain = domain.clone();
-        let server: IpAddr = resolvers::active()[resolver_index].ip;
+        let domain = round.domain.clone();
+        let (rtype, ecs, generation) = (round.rtype, round.ecs, round.generation);
+        let server: IpAddr = app.resolvers[resolver_index].ip;
         tokio::spawn(async move {
-            let (result, elapsed) = dns::query(server, domain, rtype).await;
+            let (result, elapsed, ecs_honored) = dns::query(server, domain, rtype, ecs).await;
             let _ = tx.send(QueryOutcome {
                 resolver_index,
                 generation,
                 result,
                 elapsed,
+                ecs_honored,
             });
         });
     }
 }
 
-/// Plain-text single run: query every resolver once, print a table, exit.
-async fn run_once(domain: String, rtype: RecordType, format: OutputFormat) -> Result<()> {
+/// Single run without a TTY: query every resolver once per configured ECS
+/// subnet (just once when there is none), print a table (or JSON/CSV rows)
+/// per round, and — the point of an ECS list — a final per-subnet
+/// convergence summary.
+async fn run_once(
+    domain: String,
+    rtype: RecordType,
+    ecs_list: Vec<ClientSubnet>,
+    format: OutputFormat,
+) -> Result<()> {
     let mut app = App::new(domain);
     app.rtype_idx = app::RECORD_TYPES
         .iter()
         .position(|t| *t == rtype)
         .unwrap_or(0);
-    let (domain, rtype, generation, indices) = app
-        .begin_query()
-        .ok_or_else(|| anyhow::anyhow!("empty domain"))?;
+    app.set_ecs_list(ecs_list);
 
-    // Site probes run concurrently with the query round.
+    // Site probes run concurrently with the first query round.
     let mut probes = tokio::task::JoinSet::new();
-    for (index, resolver) in resolvers::active().iter().enumerate() {
+    for (index, resolver) in app.resolvers.iter().enumerate() {
         if let Some(probe) = resolver.probe {
             let server = resolver.ip;
             probes.spawn(async move { (index, sites::discover(probe, server).await) });
         }
     }
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for resolver_index in indices {
-        let domain = domain.clone();
-        let server: IpAddr = resolvers::active()[resolver_index].ip;
-        tasks.spawn(async move {
-            let (result, elapsed) = dns::query(server, domain, rtype).await;
-            QueryOutcome {
-                resolver_index,
-                generation,
-                result,
-                elapsed,
+    let selections: Vec<Option<usize>> = if app.ecs_list.is_empty() {
+        vec![None]
+    } else {
+        (0..app.ecs_list.len()).map(Some).collect()
+    };
+    let multi = selections.len() > 1;
+    let mut convergence: Vec<String> = Vec::new();
+    // JSON is one document for the whole run, but `app.rows` is overwritten
+    // each round — capture every round's body as it finishes.
+    let mut json_rounds: Vec<(Option<ClientSubnet>, String)> = Vec::new();
+
+    for (nth, sel) in selections.into_iter().enumerate() {
+        app.ecs_sel = sel;
+        let round = app
+            .begin_query()
+            .ok_or_else(|| anyhow::anyhow!("empty domain"))?;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for resolver_index in round.indices {
+            let domain = round.domain.clone();
+            let (rtype, ecs, generation) = (round.rtype, round.ecs, round.generation);
+            let server: IpAddr = app.resolvers[resolver_index].ip;
+            tasks.spawn(async move {
+                let (result, elapsed, ecs_honored) = dns::query(server, domain, rtype, ecs).await;
+                QueryOutcome {
+                    resolver_index,
+                    generation,
+                    result,
+                    elapsed,
+                    ecs_honored,
+                }
+            });
+        }
+        while let Some(outcome) = tasks.join_next().await {
+            app.apply(outcome?);
+        }
+        if nth == 0 {
+            while let Some(probed) = probes.join_next().await {
+                let (index, site) = probed?;
+                app.sites[index] = site;
             }
-        });
-    }
-    while let Some(outcome) = tasks.join_next().await {
-        app.apply(outcome?);
-    }
-    while let Some(probed) = probes.join_next().await {
-        let (index, site) = probed?;
-        app.sites[index] = site;
+        }
+
+        let summary = app.summary();
+        match format {
+            OutputFormat::Text => {
+                print_round(&app, &summary, multi);
+                if multi {
+                    let subnet = round.ecs.expect("multi implies a subnet per round");
+                    let answer = if summary.agree > 0 {
+                        format!(
+                            "{:>2}/{} → {}",
+                            summary.agree,
+                            summary.responding,
+                            summary.majority_values.join(", ")
+                        )
+                    } else {
+                        "no agreement".into()
+                    };
+                    convergence.push(format!("  {:<20} {answer}", dns::fmt_ecs(&subnet)));
+                    println!();
+                }
+            }
+            OutputFormat::Json => {
+                json_rounds.push((round.ecs, json_round_body(&app, &summary)));
+            }
+            OutputFormat::Csv => {
+                if nth == 0 {
+                    print_csv_header(!app.ecs_list.is_empty());
+                }
+                print_csv_rows(&app, &summary, round.ecs.as_ref());
+            }
+        }
     }
 
-    let summary = app.summary();
     match format {
-        OutputFormat::Text => print_text(&domain, rtype, &app, &summary),
-        OutputFormat::Json => print_json(&domain, rtype, &app, &summary),
-        OutputFormat::Csv => print_csv(&app, &summary),
+        OutputFormat::Text if multi => {
+            let (domain, rtype, _) = app.queried.clone().expect("queried above");
+            println!("ecs convergence for {domain} {rtype}:");
+            for line in convergence {
+                println!("{line}");
+            }
+        }
+        OutputFormat::Json => {
+            let (domain, rtype, _) = app.queried.clone().expect("queried above");
+            print_json(&domain, rtype, &json_rounds);
+        }
+        _ => {}
     }
     Ok(())
 }
 
-fn print_text(domain: &str, rtype: RecordType, app: &App, summary: &app::Summary) {
-    println!("{domain} {rtype}\n");
-    for (i, (resolver, row)) in resolvers::active().iter().zip(&app.rows).enumerate() {
+/// One round's table and summary lines, in `--once`'s plain-text format.
+fn print_round(app: &App, summary: &app::Summary, multi: bool) {
+    let (domain, rtype, ecs) = app.queried.clone().expect("printed after begin_query");
+    match ecs {
+        Some(subnet) => println!("{domain} {rtype} · ecs {}\n", dns::fmt_ecs(&subnet)),
+        None => println!("{domain} {rtype}\n"),
+    }
+
+    for (i, (resolver, row)) in app.resolvers.iter().zip(&app.rows).enumerate() {
         let line = match row {
             app::RowState::Done {
-                result, elapsed, ..
-            } => match result {
-                dns::QueryResult::Records { values, min_ttl } => {
-                    let status = if summary.majority_rows[i] {
-                        "OK     "
-                    } else {
-                        "DIFFERS"
-                    };
-                    format!(
-                        "{status} {:>5}ms  ttl={:<7} {}",
-                        elapsed.as_millis(),
-                        min_ttl,
-                        values.join(", ")
-                    )
+                result,
+                elapsed,
+                ecs_honored,
+                ..
+            } => {
+                // A resolver that ignored the ECS option answered for its
+                // own vantage point, not the probed subnet: shown, but
+                // marked and kept out of the propagation summary.
+                let ignored = *ecs_honored == Some(false);
+                match result {
+                    dns::QueryResult::Records { values, min_ttl } => {
+                        let status = if ignored {
+                            "NO-ECS "
+                        } else if summary.majority_rows[i] {
+                            "OK     "
+                        } else {
+                            "DIFFERS"
+                        };
+                        format!(
+                            "{status} {:>5}ms  ttl={:<7} {}",
+                            elapsed.as_millis(),
+                            min_ttl,
+                            values.join(", ")
+                        )
+                    }
+                    dns::QueryResult::NoRecords(code) => {
+                        let status = if ignored { "NO-ECS " } else { "NONE   " };
+                        format!("{status} {:>5}ms  {code}", elapsed.as_millis())
+                    }
+                    dns::QueryResult::ServFail => {
+                        format!(
+                            "FAIL    {:>5}ms  SERVFAIL (can't resolve — broken delegation or DNSSEC?)",
+                            elapsed.as_millis()
+                        )
+                    }
+                    dns::QueryResult::Error(err) => {
+                        format!("ERR     {:>5}ms  {err}", elapsed.as_millis())
+                    }
                 }
-                dns::QueryResult::NoRecords(code) => {
-                    format!("NONE    {:>5}ms  {code}", elapsed.as_millis())
-                }
-                dns::QueryResult::ServFail => {
-                    format!(
-                        "FAIL    {:>5}ms  SERVFAIL (can't resolve — broken delegation or DNSSEC?)",
-                        elapsed.as_millis()
-                    )
-                }
-                dns::QueryResult::Error(err) => {
-                    format!("ERR     {:>5}ms  {err}", elapsed.as_millis())
-                }
-            },
+            }
             _ => "??".into(),
         };
         // Anycast resolvers that identified their answering site show it
@@ -432,10 +653,14 @@ fn print_text(domain: &str, rtype: RecordType, app: &App, summary: &app::Summary
         );
     }
 
-    println!(
+    let mut totals = format!(
         "\n{} of {} responding · {} servfail · {} unreachable · {} answer group(s)",
         summary.ok, summary.responding, summary.servfail, summary.errors, summary.groups
     );
+    if summary.ecs_blind > 0 {
+        totals.push_str(&format!(" · {} no-ecs", summary.ecs_blind));
+    }
+    println!("{totals}");
     if summary.agree > 0 {
         println!(
             "propagation ({}/{} responding): {}",
@@ -444,7 +669,10 @@ fn print_text(domain: &str, rtype: RecordType, app: &App, summary: &app::Summary
             summary.majority_values.join(", ")
         );
     }
-    if summary.responding > 0
+    // The TTL planning note repeated per subnet would be noise: the zone's
+    // TTL doesn't change with the vantage point.
+    if !multi
+        && summary.responding > 0
         && summary.agree == summary.responding
         && let Some(est) = app.estimated_ttl(summary)
         && est >= app::ADVISORY_TTL
@@ -469,19 +697,33 @@ struct OnceRow<'a> {
 fn once_row<'a>(row: &'a app::RowState, in_majority: bool) -> OnceRow<'a> {
     match row {
         app::RowState::Done {
-            result, elapsed, ..
+            result,
+            elapsed,
+            ecs_honored,
+            ..
         } => {
             let elapsed_ms = Some(elapsed.as_millis());
+            // A resolver that ignored the round's ECS option answered for
+            // its own vantage point, not the probed subnet — its own status,
+            // like the text table's NO-ECS tag. Never set without ECS, so
+            // pre-ECS output is unchanged.
+            let ignored = *ecs_honored == Some(false);
             match result {
                 dns::QueryResult::Records { values, min_ttl } => OnceRow {
-                    status: if in_majority { "ok" } else { "differs" },
+                    status: if ignored {
+                        "no-ecs"
+                    } else if in_majority {
+                        "ok"
+                    } else {
+                        "differs"
+                    },
                     elapsed_ms,
                     ttl: Some(*min_ttl),
                     values,
                     detail: None,
                 },
                 dns::QueryResult::NoRecords(code) => OnceRow {
-                    status: "none",
+                    status: if ignored { "no-ecs" } else { "none" },
                     elapsed_ms,
                     ttl: None,
                     values: &[],
@@ -513,20 +755,19 @@ fn once_row<'a>(row: &'a app::RowState, in_majority: bool) -> OnceRow<'a> {
     }
 }
 
-fn print_json(domain: &str, rtype: RecordType, app: &App, summary: &app::Summary) {
-    let resolvers = resolvers::active();
-    let mut out = String::from("{\n");
-    out.push_str(&format!("  \"domain\": {},\n", json_string(domain)));
-    out.push_str(&format!(
-        "  \"record_type\": {},\n",
-        json_string(&rtype.to_string())
-    ));
-    out.push_str("  \"resolvers\": [\n");
-    for (i, (resolver, row)) in resolvers.iter().zip(&app.rows).enumerate() {
+/// One round's `"resolvers"` array and `"summary"` object. Indentation (and
+/// the `ecs_blind` count) follow the document shape, which is fixed by
+/// whether ECS subnets are configured — see `print_json`.
+fn json_round_body(app: &App, summary: &app::Summary) -> String {
+    let with_ecs = !app.ecs_list.is_empty();
+    let pad = if with_ecs { "      " } else { "  " };
+    let mut out = String::new();
+    out.push_str(&format!("{pad}\"resolvers\": [\n"));
+    for (i, (resolver, row)) in app.resolvers.iter().zip(&app.rows).enumerate() {
         let r = once_row(row, summary.majority_rows[i]);
         let values: Vec<String> = r.values.iter().map(|v| json_string(v)).collect();
         out.push_str(&format!(
-            "    {{\"name\": {}, \"location\": {}, \"ip\": {}, \"status\": {}, \"elapsed_ms\": {}, \"ttl\": {}, \"values\": [{}], \"detail\": {}}}{}\n",
+            "{pad}  {{\"name\": {}, \"location\": {}, \"ip\": {}, \"status\": {}, \"elapsed_ms\": {}, \"ttl\": {}, \"values\": [{}], \"detail\": {}}}{}\n",
             json_string(&resolver.name),
             json_string(&resolver.location),
             json_string(&resolver.ip.to_string()),
@@ -535,34 +776,87 @@ fn print_json(domain: &str, rtype: RecordType, app: &App, summary: &app::Summary
             r.ttl.map_or("null".into(), |t| t.to_string()),
             values.join(", "),
             r.detail.map_or("null".into(), json_string),
-            if i + 1 < resolvers.len() { "," } else { "" },
+            if i + 1 < app.resolvers.len() { "," } else { "" },
         ));
     }
-    out.push_str("  ],\n");
+    out.push_str(&format!("{pad}],\n"));
     let majority: Vec<String> = summary
         .majority_values
         .iter()
         .map(|v| json_string(v))
         .collect();
+    let ecs_blind = if with_ecs {
+        format!(", \"ecs_blind\": {}", summary.ecs_blind)
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "  \"summary\": {{\"ok\": {}, \"responding\": {}, \"servfail\": {}, \"unreachable\": {}, \"groups\": {}, \"agree\": {}, \"majority_values\": [{}]}}\n",
+        "{pad}\"summary\": {{\"ok\": {}, \"responding\": {}, \"servfail\": {}, \"unreachable\": {}, \"groups\": {}, \"agree\": {}{}, \"majority_values\": [{}]}}",
         summary.ok,
         summary.responding,
         summary.servfail,
         summary.errors,
         summary.groups,
         summary.agree,
+        ecs_blind,
         majority.join(", "),
     ));
+    out
+}
+
+/// Assemble the run's single JSON document. Without ECS the shape (and
+/// bytes) match pre-ECS releases: top-level `resolvers` + `summary`. With
+/// ECS configured — a new flag, so no output contract to keep — each subnet
+/// becomes an object in a `rounds` array, tagged with its subnet.
+fn print_json(domain: &str, rtype: RecordType, rounds: &[(Option<ClientSubnet>, String)]) {
+    let mut out = String::from("{\n");
+    out.push_str(&format!("  \"domain\": {},\n", json_string(domain)));
+    out.push_str(&format!(
+        "  \"record_type\": {},\n",
+        json_string(&rtype.to_string())
+    ));
+    match rounds {
+        [(None, body)] => {
+            out.push_str(body);
+            out.push('\n');
+        }
+        _ => {
+            out.push_str("  \"rounds\": [\n");
+            for (i, (ecs, body)) in rounds.iter().enumerate() {
+                let subnet = ecs.as_ref().expect("ECS shape implies a subnet per round");
+                out.push_str(&format!(
+                    "    {{\n      \"ecs\": {},\n",
+                    json_string(&dns::fmt_ecs(subnet))
+                ));
+                out.push_str(body);
+                out.push_str(&format!(
+                    "\n    }}{}\n",
+                    if i + 1 < rounds.len() { "," } else { "" }
+                ));
+            }
+            out.push_str("  ]\n");
+        }
+    }
     out.push('}');
     println!("{out}");
 }
 
-fn print_csv(app: &App, summary: &app::Summary) {
-    println!("name,location,ip,status,elapsed_ms,ttl,values,detail");
-    for (i, (resolver, row)) in resolvers::active().iter().zip(&app.rows).enumerate() {
+/// CSV keeps one continuous row stream across ECS rounds; the trailing `ecs`
+/// column exists only when subnets are configured, so pre-ECS output is
+/// byte-identical.
+fn print_csv_header(with_ecs: bool) {
+    let base = "name,location,ip,status,elapsed_ms,ttl,values,detail";
+    if with_ecs {
+        println!("{base},ecs");
+    } else {
+        println!("{base}");
+    }
+}
+
+fn print_csv_rows(app: &App, summary: &app::Summary, ecs: Option<&ClientSubnet>) {
+    for (i, (resolver, row)) in app.resolvers.iter().zip(&app.rows).enumerate() {
         let r = once_row(row, summary.majority_rows[i]);
-        println!(
+        let mut line = format!(
             "{},{},{},{},{},{},{},{}",
             csv_field(&resolver.name),
             csv_field(&resolver.location),
@@ -573,6 +867,11 @@ fn print_csv(app: &App, summary: &app::Summary) {
             csv_field(&r.values.join("|")),
             csv_field(r.detail.unwrap_or("")),
         );
+        if let Some(subnet) = ecs {
+            line.push(',');
+            line.push_str(&csv_field(&dns::fmt_ecs(subnet)));
+        }
+        println!("{line}");
     }
 }
 

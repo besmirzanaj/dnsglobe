@@ -1,10 +1,12 @@
 use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use hickory_resolver::proto::rr::RecordType;
 
-use crate::dns::{QueryOutcome, QueryResult};
-use crate::resolvers;
+use crate::dns::{ClientSubnet, QueryOutcome, QueryResult};
+use crate::globe::GlobeView;
+use crate::resolvers::{self, Resolver};
 use crate::sites::Site;
 
 /// Watch-mode re-poll interval; propagation usually moves on TTL boundaries,
@@ -34,6 +36,24 @@ pub const RECORD_TYPES: &[RecordType] = &[
 ];
 
 pub const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Body width at which auto view switches from globe to flat map. The globe
+/// panel is square-ish so it stays useful on narrow terminals; the flat map
+/// only earns its 350°-wide canvas once there's real room next to the table.
+pub const AUTO_FLAT_WIDTH: u16 = 190;
+
+/// Which map panel to show, from `--view`, the config file, or Ctrl+O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewMode {
+    /// Globe on narrow terminals, flat map when the window is wide.
+    #[default]
+    Auto,
+    /// Always the flat map.
+    Map,
+    /// Always the globe.
+    Globe,
+}
 
 /// Table ordering, cycled with Ctrl+S. Sorts are stable, so ties keep the
 /// curated resolver-list order — `Location` therefore doubles as "group by
@@ -79,6 +99,9 @@ pub enum RowState {
         elapsed: Duration,
         /// When the answer arrived; anchors the cache-expiry countdown.
         at: Instant,
+        /// Whether the resolver honored the round's ECS option (see
+        /// `QueryOutcome::ecs_honored`). Always None on ECS-less rounds.
+        ecs_honored: Option<bool>,
     },
 }
 
@@ -143,6 +166,145 @@ pub struct Summary {
     pub majority_rows: Vec<bool>,
     /// Union of record values across the largest group.
     pub majority_values: Vec<String>,
+    /// Answers from resolvers that ignored the round's ECS option. Shown for
+    /// reference but excluded from `responding` — they describe the
+    /// resolver's own vantage point, not the probed client subnet, so they
+    /// must not drag the propagation percentage (or hold watch mode open)
+    /// on GeoDNS zones where their answer legitimately differs.
+    pub ecs_blind: usize,
+}
+
+/// Parameters of one query round, handed to the spawner in `main`.
+pub struct Round {
+    pub domain: String,
+    pub rtype: RecordType,
+    pub ecs: Option<ClientSubnet>,
+    pub generation: u64,
+    /// Resolver indices to (re)query.
+    pub indices: Vec<usize>,
+}
+
+/// The add-resolver dialog (`+`): one text field per resolver attribute,
+/// validated as a whole on Enter so a half-typed IP doesn't block editing.
+#[derive(Debug, Default)]
+pub struct ResolverForm {
+    /// Field values in `LABELS` order: name, IP, location, lat, lon.
+    pub fields: [String; 5],
+    /// Which field has focus.
+    pub focus: usize,
+    /// Cursor within the focused field. Input is ASCII-only (like the domain
+    /// field), so byte index == char index.
+    pub cursor: usize,
+    /// Last failed validation, cleared on the next edit.
+    pub error: Option<String>,
+}
+
+impl ResolverForm {
+    pub const LABELS: [&'static str; 5] = ["Name", "IP", "Location", "Lat", "Lon"];
+
+    fn field(&mut self) -> &mut String {
+        &mut self.fields[self.focus]
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        // ASCII-only keeps cursor arithmetic byte==char, like the domain
+        // input; controls would corrupt the rendered line.
+        if !c.is_ascii() || c.is_ascii_control() {
+            return;
+        }
+        let at = self.cursor;
+        self.field().insert(at, c);
+        self.cursor += 1;
+        self.error = None;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let at = self.cursor;
+            self.field().remove(at);
+            self.error = None;
+        }
+    }
+
+    pub fn delete(&mut self) {
+        let at = self.cursor;
+        if at < self.field().len() {
+            self.field().remove(at);
+            self.error = None;
+        }
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.fields[self.focus].len());
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.fields[self.focus].len();
+    }
+
+    /// Tab/↓ (or BackTab/↑) between fields; the cursor lands at the end of
+    /// the newly focused value.
+    pub fn cycle_focus(&mut self, forward: bool) {
+        let n = self.fields.len();
+        self.focus = if forward {
+            (self.focus + 1) % n
+        } else {
+            (self.focus + n - 1) % n
+        };
+        self.cursor = self.fields[self.focus].len();
+    }
+
+    /// Validate the form into a resolver. Mirrors the config file's rules
+    /// (`config::resolver_list`): IP must parse, lat/lon together or not at
+    /// all, coordinates on the globe.
+    fn validated(&self) -> Result<Resolver, String> {
+        let name = self.fields[0].trim();
+        if name.is_empty() {
+            return Err("name is required".into());
+        }
+        let ip_text = self.fields[1].trim();
+        let ip: IpAddr = ip_text
+            .parse()
+            .map_err(|_| format!("invalid IP address {ip_text:?}"))?;
+        let parse_coord = |label: &str, text: &str| -> Result<Option<f64>, String> {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            text.parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("{label} must be a number"))
+        };
+        let coords = match (
+            parse_coord("lat", &self.fields[3])?,
+            parse_coord("lon", &self.fields[4])?,
+        ) {
+            (Some(lat), Some(lon)) => {
+                if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+                    return Err("lat must be in -90..=90 and lon in -180..=180".into());
+                }
+                Some((lat, lon))
+            }
+            (None, None) => None,
+            _ => return Err("lat and lon must be given together".into()),
+        };
+        Ok(Resolver {
+            name: name.to_string(),
+            location: self.fields[2].trim().to_string(),
+            ip,
+            coords,
+            probe: None,
+        })
+    }
 }
 
 pub struct App {
@@ -155,7 +317,12 @@ pub struct App {
     pub generation: u64,
     pub spinner_frame: usize,
     pub should_quit: bool,
-    pub queried: Option<(String, RecordType)>,
+    pub queried: Option<(String, RecordType, Option<ClientSubnet>)>,
+    /// Client subnets from --ecs/config, cycled with Ctrl+N. Empty for most
+    /// runs — every trace of ECS in the UI is gated on this being non-empty.
+    pub ecs_list: Vec<ClientSubnet>,
+    /// Index into `ecs_list`; None = ECS off (the plain view of the zone).
+    pub ecs_sel: Option<usize>,
     /// Table scroll offset; clamped against the viewport during draw.
     pub scroll: usize,
     /// Watch mode: re-poll after each round until propagation reaches 100%.
@@ -165,6 +332,13 @@ pub struct App {
     pub next_poll: Option<Instant>,
     /// Active table ordering, cycled with Ctrl+S.
     pub sort: SortMode,
+    /// Flat map ↔ rotating globe morph state.
+    pub globe: GlobeView,
+    /// View policy: auto by width, or pinned by --view/config/Ctrl+O.
+    pub view_mode: ViewMode,
+    /// False until the first `sync_view`: the first frame snaps to its view
+    /// instead of replaying the morph on every launch in a narrow terminal.
+    view_synced: bool,
     /// Per-resolver anycast site discovered by that operator's identification
     /// query (issue #6): which POP is actually answering us. None = no probe
     /// or probe failed. Session-static — the site depends on our network
@@ -174,25 +348,44 @@ pub struct App {
     /// on a fresh query, preserved across re-polls — cache-behavior verdicts
     /// only exist while watching one domain/type.
     history: Vec<VecDeque<Observation>>,
+    /// The resolver list for this session: the startup list plus/minus
+    /// runtime additions and removals. `rows`, `sites` and `history` are
+    /// parallel to it.
+    pub resolvers: Vec<Resolver>,
+    /// Table row highlight, as a *resolver* index (stable across re-sorts);
+    /// ↑/↓ move it through the display order, Ctrl+X removes it.
+    pub selected: Option<usize>,
+    /// Add-resolver dialog; while open it captures all key input.
+    pub form: Option<ResolverForm>,
 }
 
 impl App {
     pub fn new(domain: String) -> Self {
+        let resolvers = resolvers::active().to_vec();
+        let n = resolvers.len();
         Self {
             cursor: domain.len(),
             domain,
             rtype_idx: 0,
-            rows: vec![RowState::Idle; resolvers::active().len()],
+            rows: vec![RowState::Idle; n],
             generation: 0,
             spinner_frame: 0,
             should_quit: false,
             queried: None,
+            ecs_list: Vec::new(),
+            ecs_sel: None,
             scroll: 0,
             auto_refresh: false,
             next_poll: None,
             sort: SortMode::default(),
-            sites: vec![None; resolvers::active().len()],
-            history: vec![VecDeque::new(); resolvers::active().len()],
+            globe: GlobeView::new(Instant::now()),
+            view_mode: ViewMode::default(),
+            view_synced: false,
+            sites: vec![None; n],
+            history: vec![VecDeque::new(); n],
+            resolvers,
+            selected: None,
+            form: None,
         }
     }
 
@@ -201,7 +394,7 @@ impl App {
     pub fn effective_location(&self, index: usize) -> &str {
         match &self.sites[index] {
             Some(site) => &site.code,
-            None => &resolvers::active()[index].location,
+            None => &self.resolvers[index].location,
         }
     }
 
@@ -211,11 +404,139 @@ impl App {
         self.sites[index]
             .as_ref()
             .and_then(|site| site.coords)
-            .or(resolvers::active()[index].coords)
+            .or(self.resolvers[index].coords)
+    }
+
+    /// Record a discovered anycast site. Keyed by IP, not index: the probe
+    /// result arrives on a channel and the list may have been edited (rows
+    /// shifted) while it was in flight.
+    pub fn set_site(&mut self, ip: IpAddr, site: Site) {
+        if let Some(index) = self.resolvers.iter().position(|r| r.ip == ip) {
+            self.sites[index] = Some(site);
+        }
     }
 
     pub fn record_type(&self) -> RecordType {
         RECORD_TYPES[self.rtype_idx]
+    }
+
+    /// ↑/↓ (±1) and PageUp/PageDown (±10): step the highlight through the
+    /// *display* order, so it moves visually even under Time/Status sorts.
+    /// The first press enters the table at the nearest end.
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let order = self.display_order(&self.summary());
+        let last = order.len() as isize - 1;
+        let position = self
+            .selected
+            .and_then(|sel| order.iter().position(|&i| i == sel));
+        let target = match position {
+            Some(p) => (p as isize).saturating_add(delta).clamp(0, last),
+            None if delta < 0 => last,
+            None => 0,
+        };
+        self.selected = Some(order[target as usize]);
+    }
+
+    /// `+`: open the add-resolver dialog.
+    pub fn open_form(&mut self) {
+        self.form = Some(ResolverForm::default());
+    }
+
+    pub fn cancel_form(&mut self) {
+        self.form = None;
+    }
+
+    /// Enter in the dialog: validate, then append the resolver. On failure
+    /// the dialog stays open showing the error. Returns a round for the new
+    /// row when a domain is being watched, so it fills in right away.
+    pub fn submit_form(&mut self) -> Option<Round> {
+        let form = self.form.as_mut()?;
+        let resolver = match form.validated() {
+            Ok(resolver) => resolver,
+            Err(message) => {
+                form.error = Some(message);
+                return None;
+            }
+        };
+        if let Some(existing) = self.resolvers.iter().find(|r| r.ip == resolver.ip) {
+            form.error = Some(format!(
+                "{} is already listed ({})",
+                resolver.ip, existing.name
+            ));
+            return None;
+        }
+        self.form = None;
+        let round = self.add_resolver(resolver);
+        // Highlight the addition — under a non-default sort the new row can
+        // land anywhere, and the highlight keeps it visible (draw follows it).
+        self.selected = Some(self.resolvers.len() - 1);
+        round
+    }
+
+    /// Append a resolver to the session list. When a query is on screen the
+    /// new row starts Pending and the returned round queries just it — on
+    /// the *current* generation: bumping it would orphan the in-flight rows
+    /// of the active round.
+    pub fn add_resolver(&mut self, resolver: Resolver) -> Option<Round> {
+        self.resolvers.push(resolver);
+        self.sites.push(None);
+        self.history.push(VecDeque::new());
+        let Some((domain, rtype, ecs)) = self.queried.clone() else {
+            self.rows.push(RowState::Idle);
+            return None;
+        };
+        self.rows.push(RowState::Pending);
+        Some(Round {
+            domain,
+            rtype,
+            ecs,
+            generation: self.generation,
+            indices: vec![self.rows.len() - 1],
+        })
+    }
+
+    /// Ctrl+X: drop the highlighted resolver. Indices shift, so results
+    /// still in flight would land on the wrong rows (or past the end) — the
+    /// generation bump discards them, and the returned round restarts the
+    /// rows that were left waiting. The last resolver can't be removed: an
+    /// empty table has nothing left to check.
+    pub fn remove_selected(&mut self) -> Option<Round> {
+        let index = self.selected?;
+        if self.resolvers.len() <= 1 {
+            return None;
+        }
+        // Keep the highlight at the same display position, on whichever row
+        // moves up into it.
+        let position = self
+            .display_order(&self.summary())
+            .iter()
+            .position(|&i| i == index)
+            .unwrap_or(0);
+        self.resolvers.remove(index);
+        self.rows.remove(index);
+        self.sites.remove(index);
+        self.history.remove(index);
+        self.generation += 1;
+        let order = self.display_order(&self.summary());
+        self.selected = order.get(position.min(order.len() - 1)).copied();
+
+        let pending: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| matches!(self.rows[i], RowState::Pending))
+            .collect();
+        let (domain, rtype, ecs) = self.queried.clone()?;
+        if pending.is_empty() {
+            return None;
+        }
+        Some(Round {
+            domain,
+            rtype,
+            ecs,
+            generation: self.generation,
+            indices: pending,
+        })
     }
 
     pub fn insert_char(&mut self, c: char) {
@@ -273,6 +594,40 @@ impl App {
         self.cursor = 0;
     }
 
+    /// The view this width calls for under the active policy.
+    pub fn desired_globe(&self, body_width: u16) -> bool {
+        match self.view_mode {
+            ViewMode::Globe => true,
+            ViewMode::Map => false,
+            ViewMode::Auto => body_width < AUTO_FLAT_WIDTH,
+        }
+    }
+
+    /// Re-assert the view target for the current width; called every frame
+    /// so resizing across the auto threshold morphs the panel. The first
+    /// call snaps (no launch animation), later changes animate.
+    pub fn sync_view(&mut self, body_width: u16) {
+        let want = self.desired_globe(body_width);
+        if self.view_synced {
+            self.globe.set_target(want, Instant::now());
+        } else {
+            self.globe.snap(want);
+            self.view_synced = true;
+        }
+    }
+
+    /// Ctrl+O: flip the view and pin it — a manual choice shouldn't be
+    /// overridden by the next resize.
+    pub fn toggle_globe(&mut self) {
+        self.view_mode = if self.globe.target() {
+            ViewMode::Map
+        } else {
+            ViewMode::Globe
+        };
+        self.globe
+            .set_target(self.view_mode == ViewMode::Globe, Instant::now());
+    }
+
     pub fn cycle_record_type(&mut self, forward: bool) {
         let n = RECORD_TYPES.len();
         self.rtype_idx = if forward {
@@ -282,19 +637,69 @@ impl App {
         };
     }
 
+    /// Install the ECS list from config/CLI. Selection starts on the first
+    /// subnet — passing --ecs means "query with it", not just "have it
+    /// available".
+    pub fn set_ecs_list(&mut self, list: Vec<ClientSubnet>) {
+        self.ecs_sel = (!list.is_empty()).then_some(0);
+        self.ecs_list = list;
+    }
+
+    /// The subnet the next Enter will query with.
+    pub fn active_ecs(&self) -> Option<ClientSubnet> {
+        self.ecs_sel.map(|i| self.ecs_list[i])
+    }
+
+    /// Ctrl+N: step the selection through the configured subnets plus an
+    /// "off" position. The caller follows up with `begin_reselect` so the
+    /// table refreshes for the new subnet without waiting for Enter.
+    pub fn cycle_ecs(&mut self) {
+        if self.ecs_list.is_empty() {
+            return;
+        }
+        self.ecs_sel = match self.ecs_sel {
+            Some(i) if i + 1 < self.ecs_list.len() => Some(i + 1),
+            Some(_) => None, // past the last subnet: ECS off
+            None => Some(0),
+        };
+    }
+
     /// Arm a new query round. Returns what to query (all resolvers), or None
     /// if the domain input is empty.
-    pub fn begin_query(&mut self) -> Option<(String, RecordType, u64, Vec<usize>)> {
+    pub fn begin_query(&mut self) -> Option<Round> {
         let domain = self.domain.trim().trim_end_matches('.').to_string();
         if domain.is_empty() {
             return None;
         }
+        Some(self.arm_round(domain, self.record_type()))
+    }
+
+    /// Arm a fresh round for the already-queried domain with the current
+    /// record-type and ECS selections: Tab and Ctrl+N re-query as they
+    /// cycle. Reads `queried`'s domain, not the (possibly mid-edit) input
+    /// field, and does nothing before the first query — there's nothing to
+    /// refresh yet.
+    pub fn begin_reselect(&mut self) -> Option<Round> {
+        let (domain, ..) = self.queried.clone()?;
+        Some(self.arm_round(domain, self.record_type()))
+    }
+
+    /// Reset every row and start a round of all resolvers, capturing the
+    /// active ECS selection. History clears too: answers under a different
+    /// subnet aren't comparable across polls.
+    fn arm_round(&mut self, domain: String, rtype: RecordType) -> Round {
         self.generation += 1;
-        self.rows = vec![RowState::Pending; resolvers::active().len()];
-        self.history = vec![VecDeque::new(); resolvers::active().len()];
-        self.queried = Some((domain.clone(), self.record_type()));
-        let all = (0..self.rows.len()).collect();
-        Some((domain, self.record_type(), self.generation, all))
+        self.rows = vec![RowState::Pending; self.resolvers.len()];
+        self.history = vec![VecDeque::new(); self.resolvers.len()];
+        let ecs = self.active_ecs();
+        self.queried = Some((domain.clone(), rtype, ecs));
+        Round {
+            domain,
+            rtype,
+            ecs,
+            generation: self.generation,
+            indices: (0..self.rows.len()).collect(),
+        }
     }
 
     /// Arm a poll of the last-queried domain/type, ignoring the (possibly
@@ -303,8 +708,12 @@ impl App {
     /// countdown still runs (a cache can't legally change before expiry), and
     /// picked up again once it hits zero — so an old-value *majority* still
     /// gets re-checked and can flip.
-    pub fn begin_requery(&mut self) -> Option<(String, RecordType, u64, Vec<usize>)> {
-        let (domain, rtype) = self.queried.clone()?;
+    pub fn begin_requery(&mut self) -> Option<Round> {
+        // Re-polls stay on the queried round's ECS subnet (Ctrl+N re-arms
+        // `queried` via begin_reselect, so the two can't drift) — mixing
+        // subnets within one table would make the group comparison
+        // meaningless.
+        let (domain, rtype, ecs) = self.queried.clone()?;
         let summary = self.summary();
         let now = Instant::now();
         let indices: Vec<usize> = (0..self.rows.len())
@@ -329,7 +738,13 @@ impl App {
         for &i in &indices {
             self.rows[i] = RowState::Pending;
         }
-        Some((domain, rtype, self.generation, indices))
+        Some(Round {
+            domain,
+            rtype,
+            ecs,
+            generation: self.generation,
+            indices,
+        })
     }
 
     pub fn apply(&mut self, outcome: QueryOutcome) {
@@ -352,6 +767,7 @@ impl App {
             result: outcome.result,
             elapsed: outcome.elapsed,
             at: now,
+            ecs_honored: outcome.ecs_honored,
         };
     }
 
@@ -501,10 +917,28 @@ impl App {
         let mut first_seen: HashMap<&str, usize> = HashMap::new();
         let mut ok_rows: Vec<usize> = Vec::new();
         for (i, row) in self.rows.iter().enumerate() {
-            let RowState::Done { result, .. } = row else {
+            let RowState::Done {
+                result,
+                ecs_honored,
+                ..
+            } = row
+            else {
                 continue;
             };
             summary.done += 1;
+            // An answer that ignored the round's ECS option is a different
+            // question's answer: keep it out of the propagation math (see
+            // `Summary::ecs_blind`). Errors and SERVFAIL keep their normal
+            // handling — they carry no echo either way.
+            if *ecs_honored == Some(false)
+                && matches!(
+                    result,
+                    QueryResult::Records { .. } | QueryResult::NoRecords(_)
+                )
+            {
+                summary.ecs_blind += 1;
+                continue;
+            }
             match result {
                 QueryResult::Records { values, .. } => {
                     summary.ok += 1;
@@ -605,6 +1039,7 @@ mod tests {
                 },
                 elapsed: Duration::from_millis(10),
                 at: Instant::now(),
+                ecs_honored: None,
             })
             .collect();
         app
@@ -649,6 +1084,7 @@ mod tests {
             result: QueryResult::Error("refused".into()),
             elapsed: Duration::from_secs(3),
             at: Instant::now(),
+            ecs_honored: None,
         });
         let s = app.summary();
         assert_eq!(s.groups, 1);
@@ -684,6 +1120,7 @@ mod tests {
             result: QueryResult::Error("timeout".into()),
             elapsed: Duration::from_secs(3),
             at: Instant::now(),
+            ecs_honored: None,
         });
         app.sort = SortMode::Status;
         let summary = app.summary();
@@ -752,6 +1189,51 @@ mod tests {
         assert_eq!(app.cursor, 1); // end of "a"
         app.move_cursor_word_right();
         assert_eq!(app.cursor, 4); // past both dots to end of "b"
+    }
+
+    #[test]
+    fn auto_view_picks_globe_below_the_width_threshold() {
+        let app = App::new("example.com".into());
+        assert!(app.desired_globe(AUTO_FLAT_WIDTH - 1));
+        assert!(!app.desired_globe(AUTO_FLAT_WIDTH));
+    }
+
+    #[test]
+    fn forced_views_ignore_the_width() {
+        let mut app = App::new("example.com".into());
+        app.view_mode = ViewMode::Globe;
+        assert!(app.desired_globe(500));
+        app.view_mode = ViewMode::Map;
+        assert!(!app.desired_globe(100));
+    }
+
+    #[test]
+    fn first_sync_snaps_then_resizes_animate() {
+        let mut app = App::new("example.com".into());
+        // Launching in a narrow terminal starts on the globe instantly.
+        app.sync_view(120);
+        assert!((app.globe.t(Instant::now()) - 1.0).abs() < 1e-9);
+        // Widening past the threshold animates back toward the flat map:
+        // target flips but the morph has barely moved yet.
+        app.sync_view(300);
+        assert!(!app.globe.target());
+        assert!(app.globe.t(Instant::now()) > 0.9);
+    }
+
+    #[test]
+    fn manual_toggle_pins_the_view_against_resizes() {
+        let mut app = App::new("example.com".into());
+        app.sync_view(300); // auto, wide → flat map
+        assert!(!app.globe.target());
+        app.toggle_globe();
+        assert_eq!(app.view_mode, ViewMode::Globe);
+        // Still globe after re-syncing at a width auto would call flat.
+        app.sync_view(300);
+        assert!(app.globe.target());
+        app.toggle_globe();
+        assert_eq!(app.view_mode, ViewMode::Map);
+        app.sync_view(120);
+        assert!(!app.globe.target());
     }
 
     #[test]
@@ -825,6 +1307,7 @@ mod tests {
                     min_ttl: 60,
                 },
                 elapsed: Duration::from_millis(10),
+                ecs_honored: None,
             });
         }
         assert_eq!(app.history[0].len(), HISTORY_CAP);
@@ -835,10 +1318,10 @@ mod tests {
     #[test]
     fn requery_skips_agreeing_rows_until_their_ttl_expires() {
         let mut app = app_with_answers(&[&["new"], &["new"], &["old"]]);
-        app.queried = Some(("example.com".into(), RecordType::A));
+        app.queried = Some(("example.com".into(), RecordType::A, None));
         // Majority rows are fresh (60s TTL): only the differing row re-polls.
-        let (_, _, _, indices) = app.begin_requery().unwrap();
-        assert_eq!(indices, vec![2]);
+        let round = app.begin_requery().unwrap();
+        assert_eq!(round.indices, vec![2]);
         assert!(matches!(app.rows[2], RowState::Pending));
         assert!(matches!(app.rows[0], RowState::Done { .. }));
     }
@@ -859,10 +1342,11 @@ mod tests {
             result: QueryResult::Error("timeout".into()),
             elapsed: Duration::from_secs(3),
             at: Instant::now(),
+            ecs_honored: None,
         });
-        app.queried = Some(("example.com".into(), RecordType::A));
-        let (_, _, _, indices) = app.begin_requery().unwrap();
-        assert_eq!(indices, vec![0, 2, 3]);
+        app.queried = Some(("example.com".into(), RecordType::A, None));
+        let round = app.begin_requery().unwrap();
+        assert_eq!(round.indices, vec![0, 2, 3]);
     }
 
     #[test]
@@ -908,6 +1392,7 @@ mod tests {
             result: QueryResult::ServFail,
             elapsed: Duration::from_millis(20),
             at: Instant::now(),
+            ecs_honored: None,
         });
         let s = app.summary();
         assert_eq!(s.servfail, 1);
@@ -929,11 +1414,354 @@ mod tests {
                 result,
                 elapsed: Duration::from_millis(20),
                 at: Instant::now(),
+                ecs_honored: None,
             });
         }
         app.sort = SortMode::Status;
         let summary = app.summary();
         assert_eq!(app.display_order(&summary), vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn ecs_cycling_steps_through_subnets_and_off() {
+        let mut app = App::new("example.com".into());
+        // No list configured: Ctrl+N is inert and ECS stays off.
+        app.cycle_ecs();
+        assert_eq!(app.active_ecs(), None);
+
+        let list = vec![
+            crate::dns::parse_ecs("203.0.113.0/24").unwrap(),
+            crate::dns::parse_ecs("198.51.100.0/24").unwrap(),
+        ];
+        app.set_ecs_list(list.clone());
+        // Configuring ECS means querying with it: selection starts on the
+        // first subnet, then cycles through the rest, off, and around.
+        assert_eq!(app.active_ecs(), Some(list[0]));
+        app.cycle_ecs();
+        assert_eq!(app.active_ecs(), Some(list[1]));
+        app.cycle_ecs();
+        assert_eq!(app.active_ecs(), None);
+        app.cycle_ecs();
+        assert_eq!(app.active_ecs(), Some(list[0]));
+    }
+
+    #[test]
+    fn requery_keeps_the_queried_rounds_subnet_despite_cycling() {
+        let subnet = crate::dns::parse_ecs("203.0.113.0/24").unwrap();
+        let mut app = App::new("example.com".into());
+        app.set_ecs_list(vec![subnet]);
+        let round = app.begin_query().unwrap();
+        assert_eq!(round.ecs, Some(subnet));
+
+        // If a watch poll fires between cycling and the Ctrl+N requery, it
+        // must stay on the queried round's subnet: mixing subnets within
+        // one table would break the group comparison.
+        app.cycle_ecs();
+        assert_eq!(app.active_ecs(), None);
+        let round = app.begin_requery().unwrap();
+        assert_eq!(round.ecs, Some(subnet));
+        // A fresh Enter picks up the new selection.
+        let round = app.begin_query().unwrap();
+        assert_eq!(round.ecs, None);
+    }
+
+    #[test]
+    fn ctrl_n_requeries_the_queried_domain_with_the_new_subnet() {
+        let list = vec![
+            crate::dns::parse_ecs("203.0.113.0/24").unwrap(),
+            crate::dns::parse_ecs("198.51.100.0/24").unwrap(),
+        ];
+        let mut app = App::new("example.com".into());
+        app.set_ecs_list(list.clone());
+
+        // Before any query there's nothing to refresh: cycling alone.
+        app.cycle_ecs();
+        assert!(app.begin_reselect().is_none());
+        app.cycle_ecs(); // back around: off
+        app.cycle_ecs(); // first subnet again
+        assert_eq!(app.active_ecs(), Some(list[0]));
+
+        let first = app.begin_query().unwrap();
+        // Ctrl+N: cycle, then a fresh full round on the *queried* domain —
+        // even while the input field is mid-edit.
+        app.insert_char('x');
+        app.cycle_ecs();
+        let round = app.begin_reselect().unwrap();
+        assert_eq!(round.domain, "example.com");
+        assert_eq!(round.ecs, Some(list[1]));
+        assert!(round.generation > first.generation);
+        assert_eq!(round.indices.len(), resolvers::active().len());
+        // The new round is what re-polls now follow.
+        assert_eq!(app.queried.as_ref().unwrap().2, Some(list[1]));
+    }
+
+    #[test]
+    fn tab_requeries_with_the_new_record_type() {
+        let mut app = App::new("example.com".into());
+        // Nothing queried yet: cycling the type refreshes nothing.
+        app.cycle_record_type(true);
+        assert!(app.begin_reselect().is_none());
+
+        app.begin_query().unwrap();
+        app.insert_char('x'); // mid-edit input must not leak into the round
+        app.cycle_record_type(true);
+        let round = app.begin_reselect().unwrap();
+        assert_eq!(round.domain, "example.com");
+        assert_eq!(round.rtype, RECORD_TYPES[2]); // A → AAAA → CNAME
+        // Re-polls follow the new type.
+        assert_eq!(app.queried.as_ref().unwrap().1, RECORD_TYPES[2]);
+    }
+
+    #[test]
+    fn ecs_blind_answers_are_excluded_from_propagation() {
+        // Two resolvers honored the subnet and agree; one (e.g. Cloudflare)
+        // ignored ECS and shows its own vantage point's answer. That row
+        // must not block 100% propagation — on GeoDNS it may never match.
+        let mut app = app_with_answers(&[&["geo"], &["geo"]]);
+        for row in &mut app.rows {
+            if let RowState::Done { ecs_honored, .. } = row {
+                *ecs_honored = Some(true);
+            }
+        }
+        app.rows.push(RowState::Done {
+            result: QueryResult::Records {
+                values: vec!["other".into()],
+                min_ttl: 60,
+            },
+            elapsed: Duration::from_millis(10),
+            at: Instant::now(),
+            ecs_honored: Some(false),
+        });
+        app.rows.push(RowState::Done {
+            result: QueryResult::NoRecords("NXDomain".into()),
+            elapsed: Duration::from_millis(10),
+            at: Instant::now(),
+            ecs_honored: Some(false),
+        });
+        let s = app.summary();
+        assert_eq!(s.ecs_blind, 2);
+        assert_eq!(s.ok, 2);
+        assert_eq!(s.no_records, 0);
+        assert_eq!(s.groups, 1);
+        assert_eq!(s.responding, 2);
+        assert_eq!(s.agree, s.responding); // watch mode can complete
+        assert_eq!(s.majority_rows, vec![true, true, false, false]);
+    }
+
+    fn resolver(name: &str, ip: &str) -> Resolver {
+        Resolver {
+            name: name.into(),
+            location: String::new(),
+            ip: ip.parse().unwrap(),
+            coords: None,
+            probe: None,
+        }
+    }
+
+    fn form_with(fields: [&str; 5]) -> ResolverForm {
+        ResolverForm {
+            fields: fields.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn add_before_any_query_appends_an_idle_row() {
+        let mut app = App::new("example.com".into());
+        let n = app.resolvers.len();
+        let round = app.add_resolver(resolver("Corp", "192.0.2.1"));
+        assert!(round.is_none());
+        assert_eq!(app.resolvers.len(), n + 1);
+        assert_eq!(app.rows.len(), n + 1);
+        assert_eq!(app.sites.len(), n + 1);
+        assert!(matches!(app.rows[n], RowState::Idle));
+    }
+
+    #[test]
+    fn add_during_a_query_rounds_up_only_the_new_row() {
+        let mut app = App::new("example.com".into());
+        let first = app.begin_query().unwrap();
+        let round = app.add_resolver(resolver("Corp", "192.0.2.1")).unwrap();
+        let new_index = app.resolvers.len() - 1;
+        assert_eq!(round.indices, vec![new_index]);
+        assert_eq!(round.domain, "example.com");
+        // Same generation: results of the round already in flight must keep
+        // landing, and the new row's result must land too.
+        assert_eq!(round.generation, first.generation);
+        assert!(matches!(app.rows[new_index], RowState::Pending));
+        app.apply(QueryOutcome {
+            resolver_index: new_index,
+            generation: round.generation,
+            result: QueryResult::Records {
+                values: vec!["x".into()],
+                min_ttl: 60,
+            },
+            elapsed: Duration::from_millis(10),
+            ecs_honored: None,
+        });
+        assert!(matches!(app.rows[new_index], RowState::Done { .. }));
+    }
+
+    #[test]
+    fn remove_drops_the_row_and_restarts_orphaned_pending_rows() {
+        let mut app = App::new("example.com".into());
+        let n = app.resolvers.len();
+        let first = app.begin_query().unwrap();
+        app.selected = Some(0);
+        let round = app.remove_selected().unwrap();
+        assert_eq!(app.resolvers.len(), n - 1);
+        assert_eq!(app.rows.len(), n - 1);
+        // Indices shifted: in-flight results are now aimed at the wrong rows,
+        // so the round that re-arms the still-pending ones supersedes them.
+        assert!(round.generation > first.generation);
+        assert_eq!(round.indices, (0..n - 1).collect::<Vec<_>>());
+        // A result from the superseded round is dropped, not misapplied.
+        app.apply(QueryOutcome {
+            resolver_index: n - 1, // out of bounds after the removal
+            generation: first.generation,
+            result: QueryResult::ServFail,
+            elapsed: Duration::from_millis(10),
+            ecs_honored: None,
+        });
+    }
+
+    #[test]
+    fn remove_with_settled_rows_needs_no_requery_and_keeps_state_aligned() {
+        let mut app = app_with_answers(&[&["a"], &["b"], &["c"]]);
+        app.resolvers.truncate(3);
+        app.sites.truncate(3);
+        app.history.truncate(3);
+        app.queried = Some(("example.com".into(), RecordType::A, None));
+        app.selected = Some(1);
+        assert!(app.remove_selected().is_none()); // nothing pending
+        // Neighbors kept their own answers: the vectors shifted together.
+        let values = |i: usize| match &app.rows[i] {
+            RowState::Done {
+                result: QueryResult::Records { values, .. },
+                ..
+            } => values.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(values(0), vec!["a"]);
+        assert_eq!(values(1), vec!["c"]);
+        // The highlight stays at the same display position: the row that
+        // moved up into it.
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn the_last_resolver_cannot_be_removed() {
+        let mut app = App::new("example.com".into());
+        app.resolvers.truncate(1);
+        app.rows.truncate(1);
+        app.sites.truncate(1);
+        app.history.truncate(1);
+        app.selected = Some(0);
+        assert!(app.remove_selected().is_none());
+        assert_eq!(app.resolvers.len(), 1);
+    }
+
+    #[test]
+    fn selection_steps_through_display_order_and_clamps() {
+        let mut app = App::new("example.com".into());
+        let last = app.resolvers.len() - 1;
+        app.move_selection(-1); // entering from below starts at the bottom
+        assert_eq!(app.selected, Some(last));
+        app.move_selection(10);
+        assert_eq!(app.selected, Some(last)); // clamped
+        app.selected = None;
+        app.move_selection(1);
+        assert_eq!(app.selected, Some(0));
+        app.move_selection(-5);
+        assert_eq!(app.selected, Some(0)); // clamped
+        app.move_selection(2);
+        assert_eq!(app.selected, Some(2));
+    }
+
+    #[test]
+    fn form_validation_reports_each_broken_field() {
+        for (fields, needle) in [
+            (["", "192.0.2.1", "", "", ""], "name is required"),
+            (["X", "not-an-ip", "", "", ""], "invalid IP address"),
+            (["X", "192.0.2.1", "", "12.0", ""], "given together"),
+            (["X", "192.0.2.1", "", "91.0", "0.0"], "-90..=90"),
+            (["X", "192.0.2.1", "", "abc", "0.0"], "lat must be a number"),
+        ] {
+            let err = form_with(fields).validated().unwrap_err();
+            assert!(err.contains(needle), "{err:?} should mention {needle:?}");
+        }
+    }
+
+    #[test]
+    fn valid_form_builds_the_resolver_with_optional_coords() {
+        let full = form_with(["Corp DNS ", " 192.0.2.1", " HQ ", "40.7", "-74.0"])
+            .validated()
+            .unwrap();
+        assert_eq!(full.name, "Corp DNS");
+        assert_eq!(full.ip, "192.0.2.1".parse::<IpAddr>().unwrap());
+        assert_eq!(full.location, "HQ");
+        assert_eq!(full.coords, Some((40.7, -74.0)));
+        let bare = form_with(["v6", "2001:db8::1", "", "", ""])
+            .validated()
+            .unwrap();
+        assert!(bare.ip.is_ipv6());
+        assert_eq!(bare.coords, None);
+    }
+
+    #[test]
+    fn submitting_a_duplicate_ip_keeps_the_form_open_with_an_error() {
+        let mut app = App::new("example.com".into());
+        let n = app.resolvers.len();
+        app.open_form();
+        let ip = app.resolvers[0].ip.to_string();
+        app.form.as_mut().unwrap().fields = ["Dup".into(), ip, "".into(), "".into(), "".into()];
+        assert!(app.submit_form().is_none());
+        assert_eq!(app.resolvers.len(), n);
+        let form = app.form.as_ref().expect("form stays open");
+        assert!(form.error.as_ref().unwrap().contains("already listed"));
+    }
+
+    #[test]
+    fn submitting_a_valid_form_adds_and_highlights_the_resolver() {
+        let mut app = App::new("example.com".into());
+        let n = app.resolvers.len();
+        app.open_form();
+        {
+            let form = app.form.as_mut().unwrap();
+            for c in "Corp".chars() {
+                form.insert_char(c);
+            }
+            form.cycle_focus(true);
+            for c in "192.0.2.1".chars() {
+                form.insert_char(c);
+            }
+        }
+        assert!(app.submit_form().is_none()); // nothing queried yet
+        assert!(app.form.is_none());
+        assert_eq!(app.resolvers.len(), n + 1);
+        assert_eq!(app.resolvers[n].name, "Corp");
+        assert_eq!(app.selected, Some(n));
+    }
+
+    #[test]
+    fn form_editing_is_per_field_with_cursor_following_focus() {
+        let mut form = ResolverForm::default();
+        form.insert_char('a');
+        form.insert_char('b');
+        form.move_cursor_left();
+        form.insert_char('x');
+        assert_eq!(form.fields[0], "axb");
+        form.backspace();
+        assert_eq!(form.fields[0], "ab");
+        form.cycle_focus(true);
+        assert_eq!(form.focus, 1);
+        assert_eq!(form.cursor, 0); // the IP field is empty
+        form.cycle_focus(false);
+        assert_eq!(form.focus, 0);
+        assert_eq!(form.cursor, 2); // back at the end of "ab"
+        form.error = Some("boom".into());
+        form.insert_char('c');
+        assert_eq!(form.error, None); // editing clears the last error
     }
 
     #[test]
@@ -945,6 +1773,7 @@ mod tests {
             result: QueryResult::NoRecords("NXDOMAIN".into()),
             elapsed: Duration::from_millis(20),
             at: Instant::now(),
+            ecs_honored: None,
         });
         let s = app.summary();
         assert_eq!(s.responding, 3);
