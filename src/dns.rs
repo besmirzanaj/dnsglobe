@@ -7,7 +7,7 @@ use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::{Edns, Message, Query, ResponseCode};
-use hickory_resolver::proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+use hickory_resolver::proto::rr::rdata::opt::{EdnsCode, EdnsOption, NSIDPayload};
 use hickory_resolver::proto::rr::{DNSClass, Name, RData, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -53,6 +53,20 @@ pub struct QueryOutcome {
     pub ecs_honored: Option<bool>,
 }
 
+/// Parse user input into a queryable name.
+///
+/// Underscores are legal in a DNS label wherever they appear, not only at
+/// the start: letter-digit-hyphen is a *hostname* rule (RFC 952, RFC 1123
+/// §2.1), while the wire format (RFC 1035 §3.1) treats a label as opaque
+/// octets. Real zones lean on that — the delegated SPF/DMARC hosts that
+/// EasyDMARC and friends hand out look like `_spf.514_ax._d.example.com`.
+/// hickory's `IntoName for &str` goes through the strict `Name::from_str`,
+/// which enforces the hostname rule, so every query path parses relaxed
+/// here instead and hands the resulting `Name` to the resolver.
+pub fn parse_name(domain: &str) -> Result<Name, String> {
+    Name::from_str_relaxed(domain).map_err(|err| err.to_string())
+}
+
 /// One-server resolver going straight at `server` (no cache, single attempt)
 /// so that server's own view of a record is what we measure.
 fn build_resolver(server: IpAddr) -> Result<TokioResolver, NetError> {
@@ -84,13 +98,22 @@ pub async fn query(
     rtype: RecordType,
     ecs: Option<ClientSubnet>,
 ) -> (QueryResult, Duration, Option<bool>) {
+    // Parsed once here so both paths agree on what is queryable. Callers
+    // validate the name up front (a malformed one is a user error worth
+    // reporting once, not 34 identical row failures), so this arm is a
+    // backstop.
+    let name = match parse_name(&domain) {
+        Ok(name) => name,
+        Err(err) => return (QueryResult::Error(short_error(err)), Duration::ZERO, None),
+    };
+
     // ECS can't ride the high-level resolver (it has no per-query EDNS
     // hook), so those queries take the raw-message path instead.
     if let Some(subnet) = ecs {
         let start = Instant::now();
         let outcome = tokio::time::timeout(
             QUERY_TIMEOUT + Duration::from_secs(1),
-            ecs_query(server, &domain, rtype, subnet),
+            ecs_query(server, name, rtype, subnet),
         )
         .await
         .unwrap_or((QueryResult::Error("timeout".into()), None));
@@ -111,7 +134,7 @@ pub async fn query(
     let start = Instant::now();
     let lookup = tokio::time::timeout(
         QUERY_TIMEOUT + Duration::from_secs(1),
-        resolver.lookup(domain.as_str(), rtype),
+        resolver.lookup(name, rtype),
     )
     .await;
     let elapsed = start.elapsed();
@@ -215,15 +238,15 @@ pub fn fmt_ecs(subnet: &ClientSubnet) -> String {
 }
 
 /// Recursive query carrying the client subnet in an EDNS OPT record.
-fn ecs_message(domain: &str, rtype: RecordType, subnet: ClientSubnet) -> Option<Message> {
+fn ecs_message(name: Name, rtype: RecordType, subnet: ClientSubnet) -> Message {
     let mut message = Message::query();
     message.metadata.recursion_desired = true;
-    message.add_query(Query::query(Name::from_str_relaxed(domain).ok()?, rtype));
+    message.add_query(Query::query(name, rtype));
     let mut edns = Edns::new();
     edns.set_max_payload(EDNS_PAYLOAD);
     edns.options_mut().insert(EdnsOption::Subnet(subnet));
     message.edns = Some(edns);
-    Some(message)
+    message
 }
 
 /// Map a raw response to the same `QueryResult` the resolver path yields,
@@ -250,13 +273,11 @@ fn classify_ecs_response(response: &Message, rtype: RecordType) -> (QueryResult,
 
 async fn ecs_query(
     server: IpAddr,
-    domain: &str,
+    name: Name,
     rtype: RecordType,
     subnet: ClientSubnet,
 ) -> (QueryResult, Option<bool>) {
-    let Some(message) = ecs_message(domain, rtype, subnet) else {
-        return (QueryResult::Error("invalid name".into()), None);
-    };
+    let message = ecs_message(name, rtype, subnet);
     match exchange(server, &message).await {
         Ok(response) => classify_ecs_response(&response, rtype),
         Err(err) => (err, None),
@@ -335,6 +356,55 @@ async fn exchange_tcp(server: IpAddr, request: &[u8], id: u16) -> Option<Message
         .ok()?;
     let response = Message::from_vec(&buf).ok()?;
     (response.metadata.id == id).then_some(response)
+}
+
+/// NSID request (RFC 5001): an EDNS option we send *empty* — that empty form
+/// is the request — which the server answers by echoing the option filled
+/// with its own identity string. It rides an ordinary query, so any server
+/// that implements it identifies itself without needing `id.server` support.
+///
+/// The carrier query is `. NS`: every recursive resolver has the root NS set
+/// cached, so it is the cheapest thing to ask, and it keeps the probe from
+/// leaking the domain the user is watching.
+fn nsid_message() -> Message {
+    let mut message = Message::query();
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(Name::root(), RecordType::NS));
+    let mut edns = Edns::new();
+    edns.set_max_payload(EDNS_PAYLOAD);
+    edns.options_mut().insert(EdnsOption::NSID(
+        NSIDPayload::new(Vec::new()).expect("an empty NSID payload always fits"),
+    ));
+    message.edns = Some(edns);
+    message
+}
+
+/// RFC 5001 leaves the payload opaque, but operators put a printable ASCII
+/// host/site name in it. Anything else is hex-encoded (what `dig +nsid`
+/// shows) rather than dropped or mangled through lossy UTF-8, which could
+/// invent letters that never crossed the wire. An empty payload — some
+/// servers echo the option back unfilled — identifies nothing, so it is None.
+fn decode_nsid(payload: &[u8]) -> Option<String> {
+    let text = if payload.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        String::from_utf8(payload.to_vec()).ok()?.trim().to_string()
+    } else {
+        payload.iter().map(|b| format!("{b:02x}")).collect()
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// Ask a server to identify itself via NSID. None means it does not support
+/// the option (or did not answer) — the caller falls back to an `id.server`
+/// probe, and failing that the resolver keeps its configured location.
+pub async fn nsid(server: IpAddr) -> Option<String> {
+    let message = nsid_message();
+    let response = exchange(server, &message).await.ok()?;
+    match response.edns.as_ref()?.option(EdnsCode::NSID)? {
+        EdnsOption::NSID(payload) => decode_nsid(payload.as_ref()),
+        // A server that echoes code 3 with something hickory could not parse
+        // as an NSID payload is not identifying itself in any usable way.
+        _ => None,
+    }
 }
 
 /// IN TXT query returning each TXT character-string separately (a record's
@@ -495,15 +565,77 @@ mod tests {
     }
 
     #[test]
+    fn parse_name_accepts_underscores_anywhere() {
+        // Underscores are a wire-format non-issue (RFC 1035 §3.1); only the
+        // *hostname* rules forbid them. Leading ones (`_dmarc`) always
+        // worked; mid-label ones are what issue #34 was about.
+        assert_eq!(
+            parse_name("_dmarc.514.ax").unwrap().to_string(),
+            "_dmarc.514.ax"
+        );
+        assert_eq!(
+            parse_name("foo_bar.example.com").unwrap().to_string(),
+            "foo_bar.example.com"
+        );
+        // A delegated SPF host, the shape that motivated the fix.
+        assert_eq!(
+            parse_name("_spf.514_ax._d.easydmarc.pro")
+                .unwrap()
+                .to_string(),
+            "_spf.514_ax._d.easydmarc.pro"
+        );
+        // Ordinary names and a trailing root dot still parse.
+        assert_eq!(
+            parse_name("foo-bar.example.com.").unwrap().to_string(),
+            "foo-bar.example.com."
+        );
+    }
+
+    #[test]
+    fn parse_name_rejects_malformed_names() {
+        // An empty label and a label over the 63-octet limit are wire-format
+        // violations, so relaxed parsing still turns them down.
+        assert!(parse_name("a..b.example.com").is_err());
+        assert!(parse_name(&format!("{}.com", "a".repeat(64))).is_err());
+        assert!(parse_name("ex@mple.com").is_err());
+    }
+
+    #[test]
     fn ecs_message_carries_the_subnet_option() {
         let subnet = parse_ecs("203.0.113.0/24").unwrap();
-        let message = ecs_message("example.com", RecordType::A, subnet).unwrap();
+        let message = ecs_message(parse_name("example.com").unwrap(), RecordType::A, subnet);
         assert!(message.metadata.recursion_desired);
         let edns = message.edns.as_ref().unwrap();
         assert_eq!(
             edns.option(EdnsCode::Subnet),
             Some(&EdnsOption::Subnet(subnet))
         );
+    }
+
+    #[test]
+    fn nsid_message_requests_an_empty_option() {
+        let message = nsid_message();
+        // RFC 5001 §2.1: the requester sends the option with zero-length data.
+        let edns = message.edns.as_ref().unwrap();
+        match edns.option(EdnsCode::NSID).unwrap() {
+            EdnsOption::NSID(payload) => assert!(payload.as_ref().is_empty()),
+            other => panic!("expected an NSID option, got {other:?}"),
+        }
+        let query = &message.queries[0];
+        assert!(query.name().is_root());
+        assert_eq!(query.query_type(), RecordType::NS);
+    }
+
+    #[test]
+    fn nsid_payloads_decode_as_ascii_or_hex() {
+        assert_eq!(decode_nsid(b"gpdns-yul").as_deref(), Some("gpdns-yul"));
+        // Trailing whitespace/NULs some servers pad with carry no meaning.
+        assert_eq!(decode_nsid(b"  yul01 ").as_deref(), Some("yul01"));
+        // Non-ASCII stays verifiable as hex instead of becoming U+FFFD.
+        assert_eq!(decode_nsid(&[0xc0, 0xff, 0xee]).as_deref(), Some("c0ffee"));
+        // An echoed-but-unfilled option identifies nothing.
+        assert_eq!(decode_nsid(b""), None);
+        assert_eq!(decode_nsid(b"   "), None);
     }
 
     /// A response as classify sees it: flip the id-generated query into a

@@ -8,18 +8,19 @@ use ratatui::widgets::canvas::{Canvas, Map, MapResolution, Painter, Shape};
 use ratatui::widgets::{Block, Borders, Cell, Clear, LineGauge, Paragraph, Row, Table, TableState};
 
 use crate::app::{
-    ADVISORY_TTL, App, RECORD_TYPES, ResolverForm, RowState, SPINNER, Summary, TtlVerdict, fmt_secs,
+    ADVISORY_TTL, App, RECORD_TYPES, ResolverForm, RowState, SPINNER, Summary, TableLayout,
+    TtlVerdict, fmt_countdown, fmt_secs,
 };
 use crate::dns::QueryResult;
 use crate::theme;
 use crate::{globe, world_data};
 
-/// Table needs ~103 cols; only show the flat map when there's room for both.
-const MIN_WIDTH_FOR_MAP: u16 = 157;
+/// Space the flat map wants beside the table: its 360°-wide canvas needs far
+/// more than the globe before it says anything the globe doesn't.
+const MAP_MARGIN: u16 = 54;
 /// The square-ish globe panel stays legible much narrower than the flat map,
 /// so it appears on terminals the flat map would have left map-less.
-const MIN_WIDTH_FOR_GLOBE: u16 = TABLE_WIDTH + 28;
-const TABLE_WIDTH: u16 = 103;
+const GLOBE_MARGIN: u16 = 28;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let summary = app.summary();
@@ -27,13 +28,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // flagging outliers mid-flight makes rows flap as the majority shifts.
     let complete = summary.done > 0 && !app.in_flight();
 
-    let advisory = ttl_advisory(app, &summary, complete);
+    let note = ttl_note(app, &summary, complete);
     // The header grows one row for the ECS line, only when --ecs/config set
     // subnets up — an ECS-less run renders exactly as before.
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(if app.ecs_list.is_empty() { 4 } else { 5 }),
         Constraint::Min(6),
-        Constraint::Length(if advisory.is_some() { 3 } else { 2 }),
+        Constraint::Length(if note.is_some() { 3 } else { 2 }),
     ])
     .areas(frame.area());
 
@@ -43,17 +44,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // and pinned modes hold), then size the panel at the morph's current
     // position so the panel reshapes along with the projection.
     app.sync_view(body.width);
+    // What the table asks for depends on the resolver list (a config with
+    // IPv6 addresses or long names needs more), so the map's threshold moves
+    // with it rather than sitting at a fixed column count.
+    let table_width = TableLayout::reserved_width(&app.resolvers);
     let geom = globe::panel_geometry(
-        body.width.saturating_sub(TABLE_WIDTH),
+        body.width.saturating_sub(table_width),
         body.height,
         app.globe.t(Instant::now()),
         info_rows(app, &summary, complete),
     );
-    let min_width = if app.globe.target() {
-        MIN_WIDTH_FOR_GLOBE
-    } else {
-        MIN_WIDTH_FOR_MAP
-    };
+    let min_width = table_width
+        + if app.globe.target() {
+            GLOBE_MARGIN
+        } else {
+            MAP_MARGIN
+        };
     let (left, right) = if body.width >= min_width {
         let [left, right] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(geom.width)]).areas(body);
@@ -75,7 +81,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_map(frame, app, &summary, complete, &geom, map_area);
         draw_map_info(frame, app, &summary, complete, info_area);
     }
-    draw_footer(frame, app, &summary, advisory, footer);
+    draw_footer(frame, app, &summary, note, footer);
     if let Some(form) = &app.form {
         draw_resolver_form(frame, form, frame.area());
     }
@@ -99,20 +105,48 @@ fn info_rows(app: &App, summary: &Summary, complete: bool) -> u16 {
     }
 }
 
-/// One-line "lower your TTL before migrating" hint, shown once a round has
-/// settled with full agreement (the planning phase — mid-migration the advice
-/// comes too late) and the zone's TTL is long.
-fn ttl_advisory(app: &App, summary: &Summary, complete: bool) -> Option<String> {
+/// One-line TTL note, shown once a round has settled with full agreement (the
+/// planning phase — mid-migration the advice comes too late). It carries the
+/// "lower your TTL before migrating" hint when the zone's TTL is long, and
+/// names any resolver holding a far longer lease than the rest: with every
+/// resolver agreeing, that cache is the one thing left that can still serve
+/// the old answer after a change.
+fn ttl_note(app: &App, summary: &Summary, complete: bool) -> Option<String> {
     if !complete || summary.responding == 0 || summary.agree != summary.responding {
         return None;
     }
     let est = app.estimated_ttl(summary)?;
-    (est >= ADVISORY_TTL).then(|| {
-        format!(
+    let mut note = String::new();
+    if est.ttl >= ADVISORY_TTL {
+        note.push_str(&format!(
             "TTL ≈ {} — planning a record change? Lower the TTL first, then wait one old-TTL period before switching.",
-            fmt_secs(u64::from(est))
-        )
-    })
+            fmt_secs(u64::from(est.ttl))
+        ));
+    }
+    if let Some(worst) = est.outliers.first() {
+        if !note.is_empty() {
+            note.push_str(" · ");
+        } else {
+            note.push_str(&format!(
+                "TTL ≈ {} ({}/{} resolvers) · ",
+                fmt_secs(u64::from(est.ttl)),
+                est.samples - est.outliers.len(),
+                est.samples
+            ));
+        }
+        let resolver = &app.resolvers[worst.index];
+        note.push_str(&format!(
+            "{} ({}) reports {}{} — that cache will serve the old answer long past the zone's TTL.",
+            resolver.name,
+            resolver.location,
+            fmt_secs(u64::from(worst.ttl)),
+            match est.outliers.len() {
+                1 => String::new(),
+                n => format!(" (+{} more)", n - 1),
+            }
+        ));
+    }
+    (!note.is_empty()).then_some(note)
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -171,6 +205,21 @@ fn draw_gauge(frame: &mut Frame, app: &App, summary: &Summary, area: Rect) {
     let th = theme::active();
     let total = app.resolvers.len();
 
+    // Enter on something that isn't a DNS name never started a round, so the
+    // gauge below would be stale (or absent): say why instead.
+    if let Some(err) = &app.input_error {
+        // Badge the label, tint the offending text: the marker is what has
+        // to catch the eye, and a filled bar under the input would shout.
+        let message = Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(" not a domain name ", th.error.style().bold()),
+            Span::raw(" "),
+            Span::styled(err.as_str(), th.error.tint()),
+        ]));
+        frame.render_widget(message, area);
+        return;
+    }
+
     if app.queried.is_none() {
         let hint = Paragraph::new(Line::from(Span::styled(
             "  type a domain and press Enter",
@@ -199,7 +248,7 @@ fn draw_gauge(frame: &mut Frame, app: &App, summary: &Summary, area: Rect) {
         } else if ratio >= 0.5 {
             th.pending
         } else {
-            th.error
+            th.error.hue()
         };
         let mut label = format!(
             " propagation {}/{} ({:.0}%)",
@@ -247,12 +296,31 @@ fn draw_gauge(frame: &mut Frame, app: &App, summary: &Summary, area: Rect) {
     frame.render_widget(gauge, area);
 }
 
+/// Numbers only read as a column when their digits line up, so every numeric
+/// cell is right-aligned — header included.
+fn right(text: impl Into<Span<'static>>) -> Cell<'static> {
+    Cell::from(Line::from(text.into()).right_aligned())
+}
+
 fn draw_table(frame: &mut Frame, app: &mut App, summary: &Summary, complete: bool, area: Rect) {
     let th = theme::active();
-    let header = Row::new([
-        "Resolver", "Loc", "IP", "Time", "TTL", "Exp", "Status", "Answer",
-    ])
-    .style(Style::new().fg(th.accent).bold());
+    let cols = TableLayout::fit(area.width, &app.resolvers);
+    let mut header = vec![
+        Cell::from(""), // the verdict glyph's margin
+        Cell::from("Resolver"),
+        Cell::from("Loc"),
+        Cell::from("IP"),
+        // Milliseconds and seconds, per the header; spelling the units out in
+        // every row is width the answer can use instead.
+        right("Ping"),
+        right("TTL"),
+        right("Exp"),
+    ];
+    if cols.status > 0 {
+        header.push(Cell::from("Status"));
+    }
+    header.push(Cell::from("Answer"));
+    let header = Row::new(header).style(Style::new().fg(th.accent).bold());
     let now = Instant::now();
 
     let order = app.display_order(summary);
@@ -265,22 +333,27 @@ fn draw_table(frame: &mut Frame, app: &mut App, summary: &Summary, complete: boo
         .iter()
         .map(|&i| (i, (&app.resolvers[i], &app.rows[i])))
         .map(|(i, (resolver, state))| {
-            let (time_cell, ttl_cell, exp_cell, status_cell, answer_cell) = match state {
+            // Every row's verdict is a glyph in the left margin plus, when
+            // there's width for it, the word: `mark` is what a scan down the
+            // edge picks up, `status` what explains it.
+            let (mark, status, time_cell, ttl_cell, exp_cell, answer_cell) = match state {
                 RowState::Idle => (
-                    Cell::from("—"),
+                    Span::styled("·", th.muted.style()),
+                    Span::styled("idle", th.muted.style()),
+                    right("—"),
                     Cell::from(""),
                     Cell::from(""),
-                    Cell::from(Span::styled("idle", th.muted.style())),
                     Cell::from(""),
                 ),
                 RowState::Pending => (
-                    Cell::from("…"),
-                    Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(Span::styled(
-                        format!("{} query", SPINNER[app.spinner_frame % SPINNER.len()]),
+                    Span::styled(
+                        SPINNER[app.spinner_frame % SPINNER.len()].to_string(),
                         Style::new().fg(th.pending),
-                    )),
+                    ),
+                    Span::styled("query", Style::new().fg(th.pending)),
+                    right("…"),
+                    Cell::from(""),
+                    Cell::from(""),
                     Cell::from(""),
                 ),
                 RowState::Done {
@@ -295,9 +368,11 @@ fn draw_table(frame: &mut Frame, app: &mut App, summary: &Summary, complete: boo
                     } else if ms < 400 {
                         Style::new().fg(th.pending)
                     } else {
-                        Style::new().fg(th.error)
+                        // A slow answer is not a failure — the hue, never the
+                        // badge, or the whole column turns into red blocks.
+                        th.error.tint()
                     };
-                    let time = Cell::from(Span::styled(format!("{ms}ms"), time_style));
+                    let time = right(Span::styled(format!("{ms}"), time_style));
                     // Answered without using the round's ECS option: its own
                     // vantage point's answer, excluded from the propagation
                     // math, so agree/differ verdicts don't apply to it.
@@ -310,20 +385,20 @@ fn draw_table(frame: &mut Frame, app: &mut App, summary: &Summary, complete: boo
                             } else {
                                 app.ttl_verdict(i, now)
                             };
-                            let (status, style) = if ecs_ignored {
-                                ("◌ NO ECS", th.muted.style())
+                            let (mark, word, style) = if ecs_ignored {
+                                ("◌", "NO ECS", th.muted.style())
                             } else {
                                 match verdict {
                                     Some(TtlVerdict::PastTtl) => {
-                                        ("! PAST TTL", Style::new().fg(th.stale).bold())
+                                        ("!", "PAST TTL", Style::new().fg(th.stale).bold())
                                     }
                                     Some(TtlVerdict::Upstream) => {
-                                        ("↻ UPSTREAM", Style::new().fg(th.upstream).bold())
+                                        ("↻", "UPSTREAM", Style::new().fg(th.upstream).bold())
                                     }
                                     None if matches_majority => {
-                                        ("✓ OK", Style::new().fg(th.agree).bold())
+                                        ("✓", "OK", Style::new().fg(th.agree).bold())
                                     }
-                                    None => ("≠ DIFFERS", Style::new().fg(th.differ).bold()),
+                                    None => ("≠", "DIFFERS", Style::new().fg(th.differ).bold()),
                                 }
                             };
                             // Live countdown to the moment this cache entry
@@ -332,17 +407,18 @@ fn draw_table(frame: &mut Frame, app: &mut App, summary: &Summary, complete: boo
                             // here", so it carries the status color.
                             let remaining = state.remaining_ttl(now).unwrap_or_default().as_secs();
                             let exp = if remaining == 0 {
-                                Span::styled("expired", th.muted.style().italic())
+                                Span::styled("0s", th.muted.style().italic())
                             } else if matches_majority || ecs_ignored {
-                                Span::styled(fmt_secs(remaining), th.muted.style())
+                                Span::styled(fmt_countdown(remaining), th.muted.style())
                             } else {
-                                Span::styled(fmt_secs(remaining), style)
+                                Span::styled(fmt_countdown(remaining), style)
                             };
                             (
+                                Span::styled(mark, style),
+                                Span::styled(word, style),
                                 time,
-                                Cell::from(format!("{min_ttl}")),
-                                Cell::from(exp),
-                                Cell::from(Span::styled(status, style)),
+                                right(format!("{min_ttl}")),
+                                right(exp),
                                 Cell::from(Span::styled(
                                     values.join(", "),
                                     if matches_majority || ecs_ignored {
@@ -354,48 +430,41 @@ fn draw_table(frame: &mut Frame, app: &mut App, summary: &Summary, complete: boo
                             )
                         }
                         QueryResult::NoRecords(code) => {
-                            let (status, style) = if ecs_ignored {
-                                ("◌ NO ECS", th.muted.style())
+                            let (mark, word, style, text) = if ecs_ignored {
+                                ("◌", "NO ECS", th.muted.style(), th.muted.style())
                             } else {
-                                ("∅ NONE", Style::new().fg(th.error).bold())
+                                // Badge on the marker, hue on the message: a
+                                // background behind a whole sentence turns
+                                // the row into a red bar.
+                                ("∅", "NONE", th.error.style().bold(), th.error.tint())
                             };
                             (
+                                Span::styled(mark, style),
+                                Span::styled(word, style),
                                 time,
                                 Cell::from(""),
                                 Cell::from(""),
-                                Cell::from(Span::styled(status, style)),
-                                Cell::from(Span::styled(
-                                    code.clone(),
-                                    if ecs_ignored {
-                                        th.muted.style()
-                                    } else {
-                                        Style::new().fg(th.error)
-                                    },
-                                )),
+                                Cell::from(Span::styled(code.clone(), text)),
                             )
                         }
                         QueryResult::ServFail => (
+                            Span::styled("✗", th.error.style().bold()),
+                            Span::styled("SERVFAIL", th.error.style().bold()),
                             time,
                             Cell::from(""),
                             Cell::from(""),
                             Cell::from(Span::styled(
-                                "✗ SERVFAIL",
-                                Style::new().fg(th.error).bold(),
-                            )),
-                            Cell::from(Span::styled(
                                 "can't resolve — broken delegation or DNSSEC?",
-                                Style::new().fg(th.error),
+                                th.error.tint(),
                             )),
                         ),
                         QueryResult::Error(message) => (
+                            Span::styled("✗", th.error.style().bold()),
+                            Span::styled("ERR", th.error.style().bold()),
                             time,
                             Cell::from(""),
                             Cell::from(""),
-                            Cell::from(Span::styled("✗ ERR", Style::new().fg(th.error).bold())),
-                            Cell::from(Span::styled(
-                                message.clone(),
-                                Style::new().fg(th.error).italic(),
-                            )),
+                            Cell::from(Span::styled(message.clone(), th.error.tint().italic())),
                         ),
                     }
                 }
@@ -409,50 +478,56 @@ fn draw_table(frame: &mut Frame, app: &mut App, summary: &Summary, complete: boo
                 )),
                 None => Cell::from(Span::styled(resolver.location.as_str(), th.muted.style())),
             };
-            Row::new(vec![
+            let mut cells = vec![
+                Cell::from(mark),
                 Cell::from(resolver.name.as_str()),
                 loc_cell,
                 Cell::from(Span::styled(resolver.ip.to_string(), th.muted.style())),
                 time_cell,
                 ttl_cell,
                 exp_cell,
-                status_cell,
-                answer_cell,
-            ])
+            ];
+            if cols.status > 0 {
+                cells.push(Cell::from(status));
+            }
+            cells.push(answer_cell);
+            Row::new(cells)
         });
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(21),
-            Constraint::Length(8),
-            Constraint::Length(15),
-            Constraint::Length(7),
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Min(20),
-        ],
-    )
-    .header(header)
-    .column_spacing(1)
-    // Reversed, not a color: readable on any theme, and it can't be confused
-    // with the status colors the row already carries.
-    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(th.muted.style())
-            .title_bottom(
-                Line::from(format!(
-                    " sort: {} (Ctrl+S) · {} resolvers (↑/↓ select) ",
-                    app.sort.label(),
-                    app.resolvers.len()
-                ))
-                .right_aligned()
-                .style(th.muted.style()),
-            ),
-    );
+    let mut constraints = vec![
+        Constraint::Length(cols.mark),
+        Constraint::Length(cols.resolver),
+        Constraint::Length(cols.loc),
+        Constraint::Length(cols.ip),
+        Constraint::Length(cols.ping),
+        Constraint::Length(cols.ttl),
+        Constraint::Length(cols.exp),
+    ];
+    if cols.status > 0 {
+        constraints.push(Constraint::Length(cols.status));
+    }
+    constraints.push(Constraint::Min(cols.answer));
+
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .column_spacing(1)
+        // Reversed, not a color: readable on any theme, and it can't be confused
+        // with the status colors the row already carries.
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(th.muted.style())
+                .title_bottom(
+                    Line::from(format!(
+                        " sort: {} (Ctrl+S) · {} resolvers (↑/↓ select) ",
+                        app.sort.label(),
+                        app.resolvers.len()
+                    ))
+                    .right_aligned()
+                    .style(th.muted.style()),
+                ),
+        );
 
     let mut state = TableState::default()
         .with_offset(app.scroll)
@@ -591,7 +666,7 @@ fn draw_map(
                         }
                         QueryResult::NoRecords(_)
                         | QueryResult::ServFail
-                        | QueryResult::Error(_) => th.error,
+                        | QueryResult::Error(_) => th.error.hue(),
                     }),
                 };
                 ctx.print(x, y, Span::styled("●", style.bold()));
@@ -610,7 +685,7 @@ fn draw_map_info(frame: &mut Frame, app: &App, summary: &Summary, complete: bool
         Span::styled("● differs  ", Style::new().fg(th.differ)),
         Span::styled("● past-ttl  ", Style::new().fg(th.stale)),
         Span::styled("● upstream  ", Style::new().fg(th.upstream)),
-        Span::styled("● error  ", Style::new().fg(th.error)),
+        Span::styled("● error  ", th.error.tint()),
         Span::styled("● pending", Style::new().fg(th.pending)),
     ];
     if !app.ecs_list.is_empty() {
@@ -651,13 +726,7 @@ fn draw_map_info(frame: &mut Frame, app: &App, summary: &Summary, complete: bool
     );
 }
 
-fn draw_footer(
-    frame: &mut Frame,
-    app: &App,
-    summary: &Summary,
-    advisory: Option<String>,
-    area: Rect,
-) {
+fn draw_footer(frame: &mut Frame, app: &App, summary: &Summary, note: Option<String>, area: Rect) {
     let th = theme::active();
     let mut status = Line::default();
     if let Some((domain, rtype, ecs)) = &app.queried {
@@ -678,17 +747,17 @@ fn draw_footer(
         status.push_span(Span::raw(" · "));
         status.push_span(Span::styled(
             format!("{} none", summary.no_records),
-            Style::new().fg(th.error),
+            th.error.tint(),
         ));
         status.push_span(Span::raw(" · "));
         status.push_span(Span::styled(
             format!("{} servfail", summary.servfail),
-            Style::new().fg(th.error),
+            th.error.tint(),
         ));
         status.push_span(Span::raw(" · "));
         status.push_span(Span::styled(
             format!("{} err", summary.errors),
-            Style::new().fg(th.error),
+            th.error.tint(),
         ));
         status.push_span(Span::raw(" · "));
         status.push_span(Span::styled(
@@ -718,18 +787,18 @@ fn draw_footer(
         ),
         th.muted.style(),
     ));
-    if let Some(advisory) = advisory {
-        let advisory_line = Line::from(vec![
+    if let Some(note) = note {
+        let note_line = Line::from(vec![
             Span::styled(" ℹ ", Style::new().fg(th.accent)),
-            Span::styled(advisory, th.muted.style().italic()),
+            Span::styled(note, th.muted.style().italic()),
         ]);
-        let [advisory_area, status_area, keys_area] = Layout::vertical([
+        let [note_area, status_area, keys_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(area);
-        frame.render_widget(Paragraph::new(advisory_line), advisory_area);
+        frame.render_widget(Paragraph::new(note_line), note_area);
         frame.render_widget(Paragraph::new(status), status_area);
         frame.render_widget(Paragraph::new(keys), keys_area);
     } else {
@@ -778,7 +847,7 @@ fn draw_resolver_form(frame: &mut Frame, form: &ResolverForm, area: Rect) {
     }
     lines.push(Line::default());
     lines.push(match &form.error {
-        Some(error) => Line::from(Span::styled(format!(" {error}"), Style::new().fg(th.error))),
+        Some(error) => Line::from(Span::styled(format!(" {error}"), th.error.tint())),
         // Which fields may stay empty, where an error would otherwise sit.
         None => Line::from(Span::styled(
             " location and lat/lon are optional",
@@ -824,5 +893,46 @@ mod tests {
         // …capped so a many-valued record doesn't crush the globe.
         summary.majority_values = vec!["v".into(); 30];
         assert_eq!(info_rows(&app, &summary, true), 26);
+    }
+
+    /// Every resolver agreeing on one answer, each with its own reported TTL.
+    fn settled_app(ttls: &[u32]) -> App {
+        let mut app = App::new("example.com".into());
+        app.rows = ttls
+            .iter()
+            .map(|&min_ttl| RowState::Done {
+                result: QueryResult::Records {
+                    values: vec!["192.0.2.1".into()],
+                    min_ttl,
+                },
+                elapsed: std::time::Duration::from_millis(10),
+                at: Instant::now(),
+                ecs_honored: None,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn ttl_note_attributes_an_outlier_rather_than_headlining_it() {
+        let n = App::new(String::new()).resolvers.len();
+        let mut ttls = vec![300u32; n - 1];
+        ttls.push(8423);
+        let app = settled_app(&ttls);
+        let note = ttl_note(&app, &app.summary(), true).unwrap();
+        // The zone's TTL leads; the lone long report is named, not obeyed.
+        assert!(note.starts_with("TTL ≈ 5m00s"), "{note}");
+        assert!(note.contains(&app.resolvers[n - 1].name), "{note}");
+        assert!(note.contains("2h20m"), "{note}");
+        assert!(!note.contains("Lower the TTL first"), "{note}");
+
+        // Nothing to say about a short TTL the whole fleet agrees on.
+        let app = settled_app(&vec![300u32; n]);
+        assert_eq!(ttl_note(&app, &app.summary(), true), None);
+
+        // A genuinely long TTL still gets the planning advice.
+        let app = settled_app(&vec![86_400u32; n]);
+        let note = ttl_note(&app, &app.summary(), true).unwrap();
+        assert!(note.starts_with("TTL ≈ 1d0h — planning"), "{note}");
     }
 }

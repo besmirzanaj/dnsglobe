@@ -27,6 +27,12 @@ consistent answer, not twenty conflicting ones. The propagation gauge shows
 how many resolvers are in the majority group; outliers are flagged
 `≠ DIFFERS` once all results are in.
 
+The table fits an 80-column terminal: every resolver's full IPv4 address,
+round-trip time, TTL and expiry countdown stay intact, and the per-row
+verdict shrinks to the glyph in the left margin (`✓ ≠ ! ↻ ∅ ✗`) so the answer
+keeps the space. The countdown is coarse on purpose — `45s`, `4m`, `2h`, `1d`
+— since a column of seconds ticking out of unison is noise above a minute.
+
 When the terminal is wide enough, a view of the world appears on the right
 with one dot per resolver, colored by status (green agrees, magenta differs,
 red error, yellow in flight). The view adapts to the width: terminals ≥157
@@ -35,13 +41,17 @@ globe, which needs fewer columns; resizing across the threshold morphs one
 into the other. Ctrl+O toggles map/globe by hand, and `--view auto|map|globe`
 (or `view = "..."` in the config file) forces a style outright.
 
-Anycast networks are asked which of their sites is answering you: Quad9
-(`TXT id.server.on.quad9.net`), Cloudflare (`CH TXT id.server`), Google
-(egress subnet via `TXT o-o.myaddr.l.google.com` matched against
-`TXT locations.publicdns.goog`), OpenDNS (`TXT debug.opendns.com`),
-CleanBrowsing, and Neustar UltraDNS. The discovered site shows in the Loc
-column as `→YUL`-style codes, and the resolver's map dot moves to the POP
-actually serving your queries.
+Every resolver is asked which of its sites is answering you, via NSID
+(RFC 5001) — an EDNS option the answering node fills with its own name
+(`gpdns-yul`, `yul01`, `res721.qyul1`, `jfk-dns1-02.inet.centurylink.net`).
+It needs no per-operator support, so resolvers you add yourself can report a
+site too. Where NSID names no place, the operator-specific identification
+queries take over: Quad9 (`TXT id.server.on.quad9.net`), Cloudflare
+(`CH TXT id.server`), Google (egress subnet via
+`TXT o-o.myaddr.l.google.com` matched against `TXT locations.publicdns.goog`),
+OpenDNS (`TXT debug.opendns.com`), CleanBrowsing, and Neustar UltraDNS. The
+discovered site shows in the Loc column as `→YUL`-style codes, and the
+resolver's map dot moves to the POP actually serving your queries.
 
 ## Usage
 
@@ -53,6 +63,7 @@ cargo install dnsglobe               # from crates.io
 yay -S dnsglobe                      # from archlinux aur (compile from source)
 yay -S dnsglobe-bin                  # from archlinux aur (install prebuilt binary)
 nix run github:besmirzanaj/dnsglobe     # Nix flakes (builds from source)
+x eget use besmirzanaj/dnsglobe      # from (from its GitHub release)
 # or grab a prebuilt binary from the GitHub Releases page
 ```
 
@@ -132,7 +143,7 @@ status. Without `--ecs`, both formats are unchanged.
 | ↑/↓ / PgUp/PgDn | move the highlight through the resolver table (scrolls to follow) |
 | +              | add a resolver for this session (name, IP, optional location and map position) |
 | Ctrl+X         | remove the highlighted resolver for this session |
-| Ctrl+S         | cycle table sort: resolver / location / time / status / answer |
+| Ctrl+S         | cycle table sort: resolver / location / ping / status / answer |
 | Ctrl+O         | toggle the world view between flat map and rotating globe |
 | Ctrl+N         | cycle the ECS client subnet and re-query (only when `--ecs`/config set one up) |
 | Ctrl+U         | clear domain                    |
@@ -175,7 +186,11 @@ ip = "198.51.100.53"
 accent   = "lightcyan"    # borders, titles, cursor, anycast sites
 agree    = "lightgreen"   # answers matching the majority; fast latency
 differ   = "lightmagenta" # answers disagreeing with the majority
-error    = "lightred"     # ERR / SERVFAIL / NONE; slow latency
+error    = "white on lightred"
+                          # ERR / SERVFAIL / NONE; slow latency. Written
+                          # "<fg> on <bg>", it becomes a filled badge on the
+                          # status glyph and word — legible on any background;
+                          # a plain color like "lightred" drops the badge
 pending  = "lightyellow"  # queries in flight; middling latency
 stale    = "208"          # caches serving an answer past its own TTL
 upstream = "lightblue"    # refetched but upstream still has the old data
@@ -193,9 +208,9 @@ startup with the offending entry named.
 ## Notes
 
 - Several resolvers are anycast networks, so the responding node is the one
-  nearest to you. Networks with an identification query report the actual
-  answering site (`→YUL`); for the rest the location column is the
-  operator's home region.
+  nearest to you. Networks that identify their node — via NSID or an
+  identification query — report the actual answering site (`→YUL`); for the
+  rest the location column is the operator's home region.
 - The built-in resolver list lives in `src/resolvers.rs`; use the config file
   above to extend or replace it without rebuilding. Every built-in entry was
   verified to answer external queries; many well-known ISP resolvers (and,
@@ -211,7 +226,7 @@ The project provides optional Nix flake outputs for users who already use Nix. T
 nix run github:besmirzanaj/dnsglobe
 
 # Specific release (uses the flake at that git tag)
-nix run github:besmirzanaj/dnsglobe/v0.3.1
+nix run github:besmirzanaj/dnsglobe/v0.5.0
 
 # Named outputs (if the flake exposes them): #latest, #source
 nix run github:besmirzanaj/dnsglobe#source

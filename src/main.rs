@@ -45,7 +45,8 @@ Configuration:
   # stale = \"208\"        #   stale, upstream, muted, coastline, grid
   # muted = \"faint\"      # colors: ANSI names (\"lightred\"), 256-color
   #                      #   indexes (\"208\"), or hex (\"#ff8700\"); `muted`
-  #                      #   also takes \"faint\" (dim the default foreground)";
+  #                      #   also takes \"faint\" (dim the default foreground)
+  # error = \"white on lightred\"  # \"<fg> on <bg>\" badges the failure marker";
 
 /// Global DNS propagation checker TUI — watch a DNS record propagate across
 /// public resolvers worldwide, on a world map in your terminal.
@@ -125,10 +126,21 @@ async fn main() -> Result<()> {
     resolvers::init(settings.resolvers);
     theme::init(settings.theme);
 
+// A name that can't go on the wire is a user error, so say so once here —
+    // before the terminal enters raw mode — instead of letting every resolver
+    // report the same parse failure and look like a network outage.
+    let domain = cli
+        .domain
+        .map(|domain| {
+            app::validate_domain(&domain)
+                .map_err(|err| anyhow::anyhow!("invalid domain name {domain:?}: {err}"))
+        })
+        .transpose()?;
+
     // `--once` runs a single check and prints to stdout — handy for scripts
     // and for testing without a TTY.
     if cli.once {
-        let domain = cli.domain.expect("clap enforces `requires`");
+        let domain = domain.expect("clap enforces `requires`");
         let format = cli.output.unwrap_or_default();
         let rtype = cli.record_type.unwrap_or(RecordType::A);
         return run_once(domain, rtype, ecs_list, format).await;
@@ -149,7 +161,7 @@ async fn main() -> Result<()> {
     }
     let result = run_tui(
         terminal,
-        cli.domain.unwrap_or_default(),
+        domain.unwrap_or_default(),
         cli.record_type,
         view,
         ecs_list,
@@ -434,13 +446,13 @@ fn poll_query(app: &mut App, tx: &mpsc::UnboundedSender<QueryOutcome>) {
     spawn_round(app, tx, round);
 }
 
-/// Ask each anycast resolver which of its sites is answering us (issue #6).
-/// One shot per run: the site follows our network path, not the query.
+/// Ask each resolver which of its sites is answering us (issues #6 and #36).
+/// One shot per run: the site follows our network path, not the query. Every
+/// resolver is asked — NSID needs no per-operator support, so even one the
+/// user added themselves can identify its node.
 fn spawn_site_probes(app: &App, site_tx: &mpsc::UnboundedSender<(IpAddr, sites::Site)>) {
     for resolver in &app.resolvers {
-        let Some(probe) = resolver.probe else {
-            continue;
-        };
+        let probe = resolver.probe;
         let site_tx = site_tx.clone();
         let server = resolver.ip;
         tokio::spawn(async move {
@@ -490,10 +502,8 @@ async fn run_once(
     // Site probes run concurrently with the first query round.
     let mut probes = tokio::task::JoinSet::new();
     for (index, resolver) in app.resolvers.iter().enumerate() {
-        if let Some(probe) = resolver.probe {
-            let server = resolver.ip;
-            probes.spawn(async move { (index, sites::discover(probe, server).await) });
-        }
+        let (probe, server) = (resolver.probe, resolver.ip);
+        probes.spawn(async move { (index, sites::discover(probe, server).await) });
     }
 
     let selections: Vec<Option<usize>> = if app.ecs_list.is_empty() {
@@ -617,10 +627,11 @@ fn print_round(app: &App, summary: &app::Summary, multi: bool) {
                         } else {
                             "DIFFERS"
                         };
+                        // Right-aligned like the TUI's numeric columns, so a
+                        // column of TTLs reads at a glance (issue #33).
                         format!(
-                            "{status} {:>5}ms  ttl={:<7} {}",
+                            "{status} {:>5}ms  ttl={min_ttl:>6}  {}",
                             elapsed.as_millis(),
-                            min_ttl,
                             values.join(", ")
                         )
                     }
@@ -647,8 +658,9 @@ fn print_round(app: &App, summary: &app::Summary, multi: bool) {
             Some(site) => format!("→{}", site.code),
             None => resolver.location.clone(),
         };
+        // Same fixed widths the TUI table uses, so the two views line up.
         println!(
-            "{:<22} {:<8} {:<16} {line}",
+            "{:<20} {:<8} {:<15} {line}",
             resolver.name, location, resolver.ip
         );
     }
@@ -675,12 +687,28 @@ fn print_round(app: &App, summary: &app::Summary, multi: bool) {
         && summary.responding > 0
         && summary.agree == summary.responding
         && let Some(est) = app.estimated_ttl(summary)
-        && est >= app::ADVISORY_TTL
     {
-        println!(
-            "note: TTL ≈ {} — planning a record change? lower the TTL first, then wait one old-TTL period before switching.",
-            app::fmt_secs(u64::from(est))
-        );
+        if est.ttl >= app::ADVISORY_TTL {
+            println!(
+                "note: TTL ≈ {} — planning a record change? lower the TTL first, then wait one old-TTL period before switching.",
+                app::fmt_secs(u64::from(est.ttl))
+            );
+        }
+        // A resolver reporting far more than the fleet isn't counted in the
+        // estimate above, but it's worth naming: that cache serves the old
+        // answer for as long as it claims, whatever the zone says.
+        for outlier in &est.outliers {
+            let resolver = &app.resolvers[outlier.index];
+            println!(
+                "note: {} ({}) reports ttl={} where {} of {} resolvers report ttl<={} — that cache will serve the old answer long past the zone's TTL.",
+                resolver.name,
+                resolver.location,
+                outlier.ttl,
+                est.samples - est.outliers.len(),
+                est.samples,
+                est.ttl,
+            );
+        }
     }
 }
 

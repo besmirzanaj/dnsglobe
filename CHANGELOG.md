@@ -6,6 +6,80 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-07
+
+### Changed
+
+- The resolver table now fits an 80-column terminal without cropping
+  anything that matters: resolver IPs are shown in full, the numeric columns
+  (Ping, TTL, Exp) are right-aligned so their digits line up, units that the
+  header already implies are gone, and where there isn't room for the
+  spelled-out status the verdict moves to a glyph in the left margin
+  (`✓ ≠ ! ↻ ∅ ✗`) — one place to scan for failures. The round-trip column is
+  now headed `Ping` (it was `Time`). Wider terminals are unchanged: they keep
+  the status word, the same answer column and the same map/globe thresholds.
+  `--once` matches: it prints the same name/location/IP column widths as the
+  TUI and right-aligns its TTL, so the two views line up.
+  ([#33](https://github.com/514-labs/dnsglobe/issues/33),
+  [#40](https://github.com/514-labs/dnsglobe/pull/40))
+- The per-row expiry countdown is coarse: at most two digits and a unit
+  (`59s`, `1m`, `59m`, `1h`, `23h`, `1d`, `99d`). A whole column of seconds
+  ticking out of unison was a distraction, and above a minute the exact
+  second never changed what you'd do. The TTL advisory notes still quote the
+  precise figure (`TTL ≈ 2h23m`).
+  ([#33](https://github.com/514-labs/dnsglobe/issues/33),
+  [#40](https://github.com/514-labs/dnsglobe/pull/40))
+- Failures now show as a white-on-red badge — on the status glyph and word in
+  the table, and on the `not a domain name` label under a malformed input —
+  rather than red text, which went washed-out on terminal themes with a
+  mid-toned background (macOS Terminal's "Ocean"). Only the marker is
+  filled — error messages, map dots, the propagation gauge and slow ping
+  times keep the plain red, so the table doesn't turn into a wall of red
+  bars. `theme.error` accepts the new `"<fg> on <bg>"` form (for example
+  `error = "black on 208"`); a plain color still works and means no badge.
+  ([#33](https://github.com/514-labs/dnsglobe/issues/33),
+  [#40](https://github.com/514-labs/dnsglobe/pull/40))
+- Anycast site discovery now asks every resolver for its NSID (RFC 5001)
+  first — a standard EDNS option servers answer with their own node name —
+  and only falls back to the old operator-specific `id.server` probes when
+  that names no place. More resolvers report where they actually answered
+  from: Lumen shows `→JFK`, CIRA Canadian Shield `→YYZ`, DNS4EU `→AMS` and
+  DNS.SB `→KIX` where they used to show only the operator's home region.
+  Resolvers you add yourself in the config file can now report a site too,
+  since NSID needs no per-operator support, and Google's site takes one
+  query instead of two. Nothing that already resolved to a site changed.
+  ([#36](https://github.com/514-labs/dnsglobe/issues/36),
+  [#39](https://github.com/514-labs/dnsglobe/pull/39))
+
+### Fixed
+
+- Names with an underscore in the middle of a label are queried instead of
+  failing on every resolver with `protocol error: Label contains invalid
+  character`. Underscores are legal anywhere in a DNS label — the
+  letter-digit-hyphen rule is about *hostnames*, not the DNS wire format — so
+  the delegated SPF/DMARC hosts that EasyDMARC, Valimail and friends generate
+  (`_spf.514_ax._d.example.com`) now resolve like they do in `dig`. Default
+  and `--ecs` runs accept exactly the same set of names; previously only
+  `--ecs` handled these.
+  ([#34](https://github.com/514-labs/dnsglobe/issues/34),
+  [#37](https://github.com/514-labs/dnsglobe/pull/37))
+- A domain that really is malformed (an empty label, a label over 63
+  characters) is now reported once — as a startup error for a name given on
+  the command line, or in place of the propagation gauge for one typed in the
+  TUI — instead of filling the table with one identical error per resolver,
+  which read like a network outage.
+  ([#37](https://github.com/514-labs/dnsglobe/pull/37))
+- The TTL note no longer lets a single resolver speak for the zone. It used to
+  report the longest TTL any agreeing resolver returned, so one resolver
+  handing back an invented 8423s turned a 300s zone into "TTL ≈ 2h23m" and
+  advised lowering a TTL that was already low. The estimate now ignores
+  reports wildly out of line with the rest of the fleet (never more than a
+  tenth of it), and any resolver that reported one is named on the note line
+  with what it claims — that cache really will serve the old answer after a
+  change, and it is worth knowing which one it is.
+  ([#35](https://github.com/514-labs/dnsglobe/issues/35),
+  [#38](https://github.com/514-labs/dnsglobe/pull/38))
+
 ## [0.4.1] - 2026-07-22
 
 Fork release: delivers upstream 0.4.0 (see below) with the fork's features
@@ -58,7 +132,6 @@ re-applied.
   toggles by hand and pins the choice; `--view auto|map|globe` or `view =
   "..."` in the config file force it outright (flag beats config).
   ([#26](https://github.com/514-labs/dnsglobe/pull/26))
-
 - Nix flake support: `nix run github:514-labs/dnsglobe` builds and runs
   dnsglobe from source on any system with Nix flakes enabled; specific
   releases can be pinned via git tag (`github:514-labs/dnsglobe/v0.3.0`).
