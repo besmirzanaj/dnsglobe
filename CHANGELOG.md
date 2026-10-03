@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-03
+
+### Changed
+
+- Restored `tag-release.yml` and `publish-crates.yml` workflows that were
+  dropped during the 0.4.0 fork merge. Version bumps on `main` now
+  auto-dispatch the release pipeline.
+- Updated `release.yml` from `push: tags` to `workflow_dispatch` with a
+  `tag` input (matching the dist-generated template from cargo-dist
+  v0.32.0), so `tag-release.yml` can trigger it without manual tag pushes.
+- Fixed `packages.yml` to only run when the Release workflow was triggered
+  by a real tag push (`workflow_run.event == 'push'`), preventing spurious
+  failures on PR-triggered Release runs.
+
 ## [0.5.1] - 2026-10-03
 
 ### Added
