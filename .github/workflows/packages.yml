@@ -7,11 +7,14 @@ on:
     workflows: [Release]
     types:
       - completed
-  workflow_dispatch:
+      # Only run when the Release workflow was triggered by a tag push
+      # (PRs run the Release workflow too, but produce no build artifacts).
 
 jobs:
   build:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # The Release workflow only produces artifacts on tag pushes.
+    # On PRs every build job is skipped, so there's nothing to package.
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
