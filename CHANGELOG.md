@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-03
+
+### Changed
+
+- .deb and .rpm packages are now built directly in the Release workflow
+  and attached to the GitHub Release, instead of being pushed to Gemfury
+  (CloudAlbania repo). Removes the external service dependency and the
+  associated request-quota limits.
+
 ## [0.5.2] - 2026-10-03
 
 ### Changed
