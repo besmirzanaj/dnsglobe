@@ -266,6 +266,17 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      - name: Build .deb and .rpm packages
+        run: |
+          # Extract the x86_64 Linux binary and wrap it with nfpm.
+          # The .deb/.rpm land in artifacts/ and get uploaded to the release.
+          mkdir -p build
+          tar xzf artifacts/dnsglobe-x86_64-unknown-linux-gnu.tar.gz -C build --strip-components=1
+          version="${{ needs.plan.outputs.tag }}"
+          version="${version#v}"
+          curl -sfL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz | tar xz -C /usr/local/bin nfpm
+          NFPMS_VERSION="$version" nfpm package --packager deb --target artifacts/
+          NFPMS_VERSION="$version" nfpm package --packager rpm --target artifacts/
       - name: Create GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
