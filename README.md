@@ -33,13 +33,15 @@ verdict shrinks to the glyph in the left margin (`✓ ≠ ! ↻ ∅ ✗`) so the
 keeps the space. The countdown is coarse on purpose — `45s`, `4m`, `2h`, `1d`
 — since a column of seconds ticking out of unison is noise above a minute.
 
-When the terminal is wide enough, a view of the world appears on the right
-with one dot per resolver, colored by status (green agrees, magenta differs,
-red error, yellow in flight). The view adapts to the width: terminals ≥157
+Press Ctrl+W (or start with `--view auto`) to show a view of the world on
+the right, with one dot per resolver, colored by status (green agrees,
+magenta differs, red error, yellow in flight). It's hidden by default so the
+table gets the full width. The view adapts to the width: terminals ≥157
 columns get a flat world map, narrower ones (≥131 columns) get a spinning 3D
 globe, which needs fewer columns; resizing across the threshold morphs one
-into the other. Ctrl+O toggles map/globe by hand, and `--view auto|map|globe`
-(or `view = "..."` in the config file) forces a style outright.
+into the other. Ctrl+O toggles map/globe by hand, and `--view
+off|auto|map|globe` (or `view = "..."` in the config file) sets the starting
+view.
 
 Every resolver is asked which of its sites is answering you, via NSID
 (RFC 5001) — an EDNS option the answering node fills with its own name
@@ -144,6 +146,7 @@ status. Without `--ecs`, both formats are unchanged.
 | +              | add a resolver for this session (name, IP, optional location and map position) |
 | Ctrl+X         | remove the highlighted resolver for this session |
 | Ctrl+S         | cycle table sort: resolver / location / ping / status / answer |
+| Ctrl+W         | show or hide the world view (hidden by default) |
 | Ctrl+O         | toggle the world view between flat map and rotating globe |
 | Ctrl+N         | cycle the ECS client subnet and re-query (only when `--ecs`/config set one up) |
 | Ctrl+U         | clear domain                    |
@@ -164,7 +167,8 @@ replace = false
 # EDNS Client Subnet(s) to query with (Ctrl+N cycles; --ecs overrides).
 ecs = ["203.0.113.0/24"]
 
-# World-view style: auto (default — pick by terminal width), map, or globe.
+# World view: off (default — table only), auto (pick map or globe by
+# terminal width), map, or globe. Ctrl+W shows/hides it at runtime.
 # The --view flag overrides this.
 view = "auto"
 

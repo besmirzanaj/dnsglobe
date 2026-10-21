@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Ctrl+W shows or hides the world map/globe panel, and `--view off` (or
+  `view = "off"` in the config file) starts with it hidden. Ctrl+O on a
+  hidden panel shows it as the globe or the map.
+
+### Changed
+
+- The world panel is now hidden by default, so the table gets the full
+  terminal width. Pass `--view auto` or set `view = "auto"` in the config
+  file to get the previous behavior.
+
 ## [0.5.2] - 2026-10-03
 
 ### Changed

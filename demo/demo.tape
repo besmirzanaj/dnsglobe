@@ -15,7 +15,7 @@ Show
 
 # real ISP subnets (Comcast US, Telstra AU) — documentation ranges like
 # 203.0.113.0/24 get REFUSED by Google when sent as ECS
-Type "dnsglobe 514.ax --ecs 73.98.0.0/24,1.128.0.0/24"
+Type "dnsglobe 514.ax --view auto --ecs 73.98.0.0/24,1.128.0.0/24"
 Sleep 800ms
 Enter
 # initial A-record round streams in with the first ECS subnet active;

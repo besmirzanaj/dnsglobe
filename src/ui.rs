@@ -60,7 +60,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             MAP_MARGIN
         };
-    let (left, right) = if body.width >= min_width {
+    let (left, right) = if app.world_visible() && body.width >= min_width {
         let [left, right] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(geom.width)]).areas(body);
         (left, Some(right))
@@ -783,7 +783,7 @@ fn draw_footer(frame: &mut Frame, app: &App, summary: &Summary, note: Option<Str
     };
     let keys = Line::from(Span::styled(
         format!(
-            " type to edit · ←/→ move cursor (⌥/Ctrl word, ⌘/Home/End ends) · Enter query+watch · Ctrl+R watch on/off · Ctrl+S sort · Ctrl+O globe/map · Tab record type{ecs_hint} · ↑/↓ select · + add resolver · Ctrl+X remove · Esc quit"
+            " type to edit · ←/→ move cursor (⌥/Ctrl word, ⌘/Home/End ends) · Enter query+watch · Ctrl+R watch on/off · Ctrl+S sort · Ctrl+W world on/off · Ctrl+O globe/map · Tab record type{ecs_hint} · ↑/↓ select · + add resolver · Ctrl+X remove · Esc quit"
         ),
         th.muted.style(),
     ));

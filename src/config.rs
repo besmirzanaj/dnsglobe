@@ -326,6 +326,7 @@ mod tests {
     #[test]
     fn view_parses_all_modes_and_rejects_typos() {
         for (text, want) in [
+            ("view = \"off\"", ViewMode::Off),
             ("view = \"auto\"", ViewMode::Auto),
             ("view = \"map\"", ViewMode::Map),
             ("view = \"globe\"", ViewMode::Globe),
