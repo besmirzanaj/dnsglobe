@@ -29,7 +29,7 @@ Configuration:
   is missing), else $XDG_CONFIG_HOME/dnsglobe/config.toml, else
   ~/.config/dnsglobe/config.toml.
 
-  # view = \"globe\"       # map panel style: auto (default) | map | globe
+  # view = \"globe\"       # world panel: off (default) | auto | map | globe
   # replace = true       # use only the resolvers below, drop the built-ins
   # ecs = [\"203.0.113.0/24\"]  # EDNS Client Subnet(s) to query with;
   #                      #   cycle with Ctrl+N (--ecs overrides the list)
@@ -73,8 +73,9 @@ struct Cli {
     #[arg(long, value_enum, requires = "once")]
     output: Option<OutputFormat>,
 
-    /// Map panel style: auto picks the globe on narrow terminals and the
-    /// flat map on wide ones [overrides the config file's `view`]
+    /// World panel: off (default) hides it, auto picks the globe on narrow
+    /// terminals and the flat map on wide ones [overrides the config file's
+    /// `view`]
     #[arg(long, value_enum)]
     view: Option<app::ViewMode>,
 
@@ -293,6 +294,11 @@ fn handle_key(
         }
         KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.sort = app.sort.next();
+        }
+        // Ctrl+W: "W" is the world panel. There's no delete-word binding in
+        // the input field, so readline muscle memory only hides the panel.
+        KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_world();
         }
         // Ctrl+O: "O" is the globe. Ctrl+G would be the natural mnemonic but
         // it's the BEL character, which some terminal setups intercept.

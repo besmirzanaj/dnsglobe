@@ -48,12 +48,15 @@ pub const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', 
 /// only earns its 350°-wide canvas once there's real room next to the table.
 pub const AUTO_FLAT_WIDTH: u16 = 190;
 
-/// Which map panel to show, from `--view`, the config file, or Ctrl+O.
+/// Which map panel to show, from `--view`, the config file, Ctrl+W or Ctrl+O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ViewMode {
-    /// Globe on narrow terminals, flat map when the window is wide.
+    /// No world panel: the table gets the whole width. The default — the
+    /// table carries the data, the panel is opt-in (Ctrl+W or --view).
     #[default]
+    Off,
+    /// Globe on narrow terminals, flat map when the window is wide.
     Auto,
     /// Always the flat map.
     Map,
@@ -380,8 +383,11 @@ pub struct App {
     pub sort: SortMode,
     /// Flat map ↔ rotating globe morph state.
     pub globe: GlobeView,
-    /// View policy: auto by width, or pinned by --view/config/Ctrl+O.
+    /// View policy: hidden, auto by width, or pinned by --view/config/Ctrl+O.
     pub view_mode: ViewMode,
+    /// What Ctrl+W brings back when it re-shows a hidden panel, so hiding
+    /// and showing again doesn't lose a pinned map/globe choice.
+    shown_view: ViewMode,
     /// False until the first `sync_view`: the first frame snaps to its view
     /// instead of replaying the morph on every launch in a narrow terminal.
     view_synced: bool,
@@ -431,6 +437,7 @@ impl App {
             sort: SortMode::default(),
             globe: GlobeView::new(Instant::now()),
             view_mode: ViewMode::default(),
+            shown_view: ViewMode::Auto,
             view_synced: false,
             sites: vec![None; n],
             history: vec![VecDeque::new(); n],
@@ -650,11 +657,16 @@ impl App {
         self.input_error = None;
     }
 
+    /// Whether the world panel is drawn at all.
+    pub fn world_visible(&self) -> bool {
+        self.view_mode != ViewMode::Off
+    }
+
     /// The view this width calls for under the active policy.
     pub fn desired_globe(&self, body_width: u16) -> bool {
         match self.view_mode {
             ViewMode::Globe => true,
-            ViewMode::Map => false,
+            ViewMode::Map | ViewMode::Off => false,
             ViewMode::Auto => body_width < AUTO_FLAT_WIDTH,
         }
     }
@@ -663,6 +675,11 @@ impl App {
     /// so resizing across the auto threshold morphs the panel. The first
     /// call snaps (no launch animation), later changes animate.
     pub fn sync_view(&mut self, body_width: u16) {
+        // A hidden panel leaves the morph alone, so re-showing it picks up
+        // where it was (or snaps, if it was never shown).
+        if !self.world_visible() {
+            return;
+        }
         let want = self.desired_globe(body_width);
         if self.view_synced {
             self.globe.set_target(want, Instant::now());
@@ -672,8 +689,19 @@ impl App {
         }
     }
 
+    /// Ctrl+W: hide the world panel, or bring back whatever it showed last.
+    pub fn toggle_world(&mut self) {
+        if self.world_visible() {
+            self.shown_view = self.view_mode;
+            self.view_mode = ViewMode::Off;
+        } else {
+            self.view_mode = self.shown_view;
+        }
+    }
+
     /// Ctrl+O: flip the view and pin it — a manual choice shouldn't be
-    /// overridden by the next resize.
+    /// overridden by the next resize. On a hidden panel it also shows it:
+    /// a key that changes nothing visible reads as broken.
     pub fn toggle_globe(&mut self) {
         self.view_mode = if self.globe.target() {
             ViewMode::Map
@@ -1501,7 +1529,8 @@ mod tests {
 
     #[test]
     fn auto_view_picks_globe_below_the_width_threshold() {
-        let app = App::new("example.com".into());
+        let mut app = App::new("example.com".into());
+        app.view_mode = ViewMode::Auto;
         assert!(app.desired_globe(AUTO_FLAT_WIDTH - 1));
         assert!(!app.desired_globe(AUTO_FLAT_WIDTH));
     }
@@ -1518,6 +1547,7 @@ mod tests {
     #[test]
     fn first_sync_snaps_then_resizes_animate() {
         let mut app = App::new("example.com".into());
+        app.view_mode = ViewMode::Auto;
         // Launching in a narrow terminal starts on the globe instantly.
         app.sync_view(120);
         assert!((app.globe.t(Instant::now()) - 1.0).abs() < 1e-9);
@@ -1526,6 +1556,36 @@ mod tests {
         app.sync_view(300);
         assert!(!app.globe.target());
         assert!(app.globe.t(Instant::now()) > 0.9);
+    }
+
+    #[test]
+    fn world_panel_is_hidden_by_default() {
+        let mut app = App::new("example.com".into());
+        assert!(!app.world_visible());
+        // Frames drawn while hidden don't consume the first-show snap.
+        app.sync_view(120);
+        app.toggle_world();
+        assert_eq!(app.view_mode, ViewMode::Auto);
+        app.sync_view(120);
+        assert!((app.globe.t(Instant::now()) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hiding_and_showing_keeps_a_pinned_view() {
+        let mut app = App::new("example.com".into());
+        app.view_mode = ViewMode::Map;
+        app.toggle_world();
+        assert!(!app.world_visible());
+        app.toggle_world();
+        assert_eq!(app.view_mode, ViewMode::Map);
+    }
+
+    #[test]
+    fn globe_toggle_on_a_hidden_panel_shows_it() {
+        let mut app = App::new("example.com".into());
+        app.toggle_globe();
+        assert!(app.world_visible());
+        assert_eq!(app.view_mode, ViewMode::Globe);
     }
 
     #[test]
