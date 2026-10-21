@@ -6,12 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
 ### Added
 
 - Ctrl+W shows or hides the world map/globe panel, and `--view off` (or
   `view = "off"` in the config file) starts with it hidden. Ctrl+O on a
   hidden panel shows it as the globe or the map.
   ([#6](https://github.com/besmirzanaj/dnsglobe/pull/6))
+- Linux `.deb` and `.rpm` packages are attached to each GitHub Release as
+  well as published to the apt/yum repository, so they can be downloaded
+  directly when the repository is unavailable.
 
 ### Changed
 
